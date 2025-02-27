@@ -33,6 +33,7 @@ mod list_indexing;
 mod list_reduce;
 mod logical;
 mod numeric;
+mod predicate;
 mod string;
 mod time;
 

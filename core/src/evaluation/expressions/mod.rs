@@ -530,6 +530,7 @@ impl ExpressionEvaluator {
                     VariableValue::Bool(d1 == d2)
                 }
                 (VariableValue::Awaiting, VariableValue::Awaiting) => VariableValue::Bool(true),
+                (VariableValue::Null, _) | (_, VariableValue::Null) => VariableValue::Null,
                 _ => VariableValue::Bool(false),
             },
             ast::BinaryExpression::Ne(e1, e2) => match (
@@ -589,6 +590,7 @@ impl ExpressionEvaluator {
                 (VariableValue::ElementReference(e1), VariableValue::ElementReference(e2)) => {
                     VariableValue::Bool(e1 != e2)
                 }
+                (VariableValue::Null, _) | (_, VariableValue::Null) => VariableValue::Null,
                 _ => VariableValue::Bool(false),
             },
             ast::BinaryExpression::Lt(e1, e2) => match (
@@ -729,6 +731,7 @@ impl ExpressionEvaluator {
                             < *d2.duration() + Duration::days(30 * month2),
                     )
                 }
+                (VariableValue::Null, _) | (_, VariableValue::Null) => VariableValue::Null,
                 _ => VariableValue::Bool(false),
             },
             ast::BinaryExpression::Le(e1, e2) => match (
@@ -869,6 +872,7 @@ impl ExpressionEvaluator {
                             <= *d2.duration() + Duration::days(30 * month2),
                     )
                 }
+                (VariableValue::Null, _) | (_, VariableValue::Null) => VariableValue::Null,
                 _ => VariableValue::Bool(false),
             },
             ast::BinaryExpression::Gt(e1, e2) => match (
@@ -1033,6 +1037,7 @@ impl ExpressionEvaluator {
                             > *d2.duration() + Duration::days(30 * month2),
                     )
                 }
+                (VariableValue::Null, _) | (_, VariableValue::Null) => VariableValue::Null,
                 _ => VariableValue::Bool(false),
             },
             ast::BinaryExpression::Ge(e1, e2) => match (
@@ -1176,6 +1181,7 @@ impl ExpressionEvaluator {
                 (VariableValue::ZonedDateTime(zdt1), VariableValue::ZonedDateTime(zdt2)) => {
                     VariableValue::Bool(zdt1.datetime() >= zdt2.datetime())
                 }
+                (VariableValue::Null, _) | (_, VariableValue::Null) => VariableValue::Null,
                 _ => VariableValue::Bool(false),
             },
             ast::BinaryExpression::Add(e1, e2) => {

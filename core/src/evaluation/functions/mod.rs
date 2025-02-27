@@ -32,6 +32,7 @@ use self::{
     cypher_scalar::RegisterCypherScalarFunctions,
     drasi::RegisterDrasiFunctions,
     list::RegisterListFunctions,
+    predicate::RegisterPredicateFunctions,
     metadata::RegisterMetadataFunctions,
     numeric::RegisterNumericFunctions,
     temporal_duration::RegisterTemporalDurationFunctions,
@@ -48,6 +49,7 @@ pub mod drasi;
 pub mod future;
 pub mod list;
 pub mod metadata;
+pub mod predicate;
 pub mod numeric;
 pub mod past;
 pub mod temporal_duration;
@@ -143,6 +145,7 @@ impl FunctionRegistry {
         result.register_temporal_instant_functions();
         result.register_temporal_duration_functions();
         result.register_list_functions();
+        result.register_predicate_functions();
         result.register_drasi_functions();
         result.register_scalar_functions();
         result.register_context_mutators();

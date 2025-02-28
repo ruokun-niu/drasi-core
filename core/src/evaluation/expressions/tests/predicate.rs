@@ -272,3 +272,65 @@ async fn test_all_with_some_elements_null_and_some_elements_false_returns_false(
         
     }
 }
+
+#[tokio::test]
+async fn test_exists_with_valid_property_returns_true() {
+    let expr = "exists($param1.name)";
+    let expr = drasi_query_cypher::parse_expression(expr).unwrap();
+
+    let function_registry = Arc::new(FunctionRegistry::new());
+    let ari = Arc::new(InMemoryResultIndex::new());
+    let evaluator = ExpressionEvaluator::new(function_registry.clone(), ari.clone());   
+    let mut variables = QueryVariables::new();
+    let param1_node = VariableValue::Object({
+        let mut map = BTreeMap::new();
+        map.insert("name".to_string(), VariableValue::String("foo".to_string()));
+        map
+    });
+    variables.insert("param1".into(), param1_node);
+
+    {
+        let context =
+            ExpressionEvaluationContext::new(&variables, Arc::new(InstantQueryClock::new(0, 0)));
+        assert_eq!(
+            evaluator
+                .evaluate_expression(&context, &expr)
+                .await
+                .unwrap(),
+            VariableValue::Bool(true)
+        );
+        
+    }
+
+}
+
+
+#[tokio::test]
+async fn test_exists_with_null_property_returns_null() {
+    let expr = "exists($param1.name)";
+    let expr = drasi_query_cypher::parse_expression(expr).unwrap();
+
+    let function_registry = Arc::new(FunctionRegistry::new());
+    let ari = Arc::new(InMemoryResultIndex::new());
+    let evaluator = ExpressionEvaluator::new(function_registry.clone(), ari.clone());   
+    let mut variables = QueryVariables::new();
+    let param1_node = VariableValue::Object({
+        let mut map = BTreeMap::new();
+        map.insert("name".to_string(), VariableValue::Null);
+        map
+    });
+    variables.insert("param1".into(), param1_node);
+
+    {
+        let context =
+            ExpressionEvaluationContext::new(&variables, Arc::new(InstantQueryClock::new(0, 0)));
+        assert_eq!(
+            evaluator
+                .evaluate_expression(&context, &expr)
+                .await
+                .unwrap(),
+            VariableValue::Null
+        );
+        
+    }
+}

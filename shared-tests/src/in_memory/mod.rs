@@ -356,3 +356,39 @@ mod unwind {
         unwind::unwind(&test_config).await;
     }
 }
+
+mod predicate {
+    use super::InMemoryQueryConfig;
+    use crate::predicate::exists;
+
+    #[tokio::test]
+    async fn exists() {
+        let test_config = InMemoryQueryConfig::new();
+        exists::test_exists_with_some_valid_properties(&test_config).await;
+    }
+}
+
+// mod temporal_retrieval {
+//     use super::InMemoryQueryConfig;
+//     use crate::temporal_retrieval::get_version_by_timestamp;
+//     use crate::temporal_retrieval::get_versions_by_timerange;
+
+//     #[tokio::test]
+//     async fn get_version_by_timestamp() {
+//         let test_config = InMemoryQueryConfig::new();
+//         get_version_by_timestamp::get_version_by_timestamp(&test_config).await;
+//     }
+
+//     #[tokio::test]
+//     async fn get_versions_by_timerange_with_initial_value_flag() {
+//         let test_config = InMemoryQueryConfig::new();
+//         get_versions_by_timerange::get_versions_by_timerange_with_initial_value_flag(&test_config)
+//             .await;
+//     }
+
+//     #[tokio::test]
+//     async fn get_versions_by_range() {
+//         let test_config = InMemoryQueryConfig::new();
+//         get_versions_by_timerange::get_versions_by_timerange(&test_config).await;
+//     }
+// }

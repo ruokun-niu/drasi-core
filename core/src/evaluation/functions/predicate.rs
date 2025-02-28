@@ -18,6 +18,9 @@ use std::sync::Arc;
 
 mod all;
 pub use all::All;
+
+mod exists;
+pub use exists::Exists;
 pub trait RegisterPredicateFunctions {
     fn register_predicate_functions(&self);    
 }
@@ -25,5 +28,6 @@ pub trait RegisterPredicateFunctions {
 impl RegisterPredicateFunctions for FunctionRegistry {
     fn register_predicate_functions(&self) {
         self.register_function("all", Function::LazyScalar(Arc::new(All::new())));
+        self.register_function("exists", Function::LazyScalar(Arc::new(Exists::new())));
     }
 }

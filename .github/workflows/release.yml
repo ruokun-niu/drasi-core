@@ -80,7 +80,7 @@ jobs:
               -p drasi-functions-gql \
               -p drasi-middleware \
               -p drasi-lib \
-              --no-push --no-tag --no-publish
+              --no-push --no-tag --no-publish --no-confirm
           else
             echo "Releasing core-and-lib..."
             cargo release ${{ inputs.version_bump }} \
@@ -92,6 +92,7 @@ jobs:
               -p drasi-functions-gql \
               -p drasi-middleware \
               -p drasi-lib \
+              --no-confirm \
               --execute
           fi
 
@@ -105,11 +106,12 @@ jobs:
             echo "Running dry-run for ${{ inputs.component_name }} release..."
             cargo release ${{ inputs.version_bump }} \
               -p ${{ inputs.component_name }} \
-              --no-push --no-tag --no-publish
+              --no-push --no-tag --no-publish --no-confirm
           else
             echo "Releasing ${{ inputs.component_name }}..."
             cargo release ${{ inputs.version_bump }} \
               -p ${{ inputs.component_name }} \
+              --no-confirm \
               --execute
           fi
 

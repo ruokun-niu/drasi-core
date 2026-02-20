@@ -19,6 +19,7 @@ use handlebars::Handlebars;
 use log::debug;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 
 use drasi_lib::channels::{ComponentEventSender, ComponentStatus, ResultDiff};
@@ -170,6 +171,7 @@ impl LogReaction {
     #[allow(clippy::print_stdout)]
     fn log_result(&self, message: &str) {
         println!("[{}] {}", self.base.id, message);
+        let _ = std::io::stdout().flush();
     }
 
     /// Create a builder for LogReaction
@@ -437,6 +439,7 @@ impl Reaction for LogReaction {
                         query_result.query_id,
                         query_result.results.len()
                     );
+                    let _ = std::io::stdout().flush();
                 }
 
                 for result in &query_result.results {
@@ -484,6 +487,7 @@ impl Reaction for LogReaction {
                                     println!("[{reaction_name}]   [ADD] {data}");
                                 }
                             }
+                            let _ = std::io::stdout().flush();
                         }
                         ResultDiff::Delete { data } => {
                             context.insert("operation".to_string(), Value::String("DELETE".into()));
@@ -515,6 +519,7 @@ impl Reaction for LogReaction {
                                     println!("[{reaction_name}]   [DELETE] {data}");
                                 }
                             }
+                            let _ = std::io::stdout().flush();
                         }
                         ResultDiff::Update {
                             before,
@@ -568,6 +573,7 @@ impl Reaction for LogReaction {
                             {
                                 println!("[{reaction_name}]   [{operation}] {result_json}");
                             }
+                            let _ = std::io::stdout().flush();
                         }
                     }
                 }

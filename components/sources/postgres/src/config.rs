@@ -17,6 +17,7 @@
 //! This source monitors PostgreSQL databases using logical replication to stream
 //! data changes as they occur.
 
+use drasi_lib::identity::IdentityProvider;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -59,7 +60,7 @@ pub struct TableKeyConfig {
 }
 
 /// PostgreSQL replication source configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PostgresSourceConfig {
     /// PostgreSQL host
     #[serde(default = "default_postgres_host")]
@@ -72,7 +73,12 @@ pub struct PostgresSourceConfig {
     /// Database name
     pub database: String,
 
+    /// Identity provider for authentication (takes precedence over user/password)
+    #[serde(skip)]
+    pub identity_provider: Option<Box<dyn IdentityProvider>>,
+
     /// Database user
+    #[serde(default)]
     pub user: String,
 
     /// Database password
@@ -116,6 +122,41 @@ fn default_publication_name() -> String {
     "drasi_publication".to_string()
 }
 
+// Manual Debug implementation to avoid issues with trait objects
+impl std::fmt::Debug for PostgresSourceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresSourceConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("identity_provider", &self.identity_provider.is_some())
+            .field("user", &self.user)
+            .field("password", &"***")
+            .field("tables", &self.tables)
+            .field("slot_name", &self.slot_name)
+            .field("publication_name", &self.publication_name)
+            .field("ssl_mode", &self.ssl_mode)
+            .field("table_keys", &self.table_keys)
+            .finish()
+    }
+}
+
+// Manual PartialEq implementation that skips the identity_provider field
+impl PartialEq for PostgresSourceConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.host == other.host
+            && self.port == other.port
+            && self.database == other.database
+            && self.user == other.user
+            && self.password == other.password
+            && self.tables == other.tables
+            && self.slot_name == other.slot_name
+            && self.publication_name == other.publication_name
+            && self.ssl_mode == other.ssl_mode
+            && self.table_keys == other.table_keys
+    }
+}
+
 impl PostgresSourceConfig {
     /// Validate the configuration and return an error if invalid.
     ///
@@ -123,7 +164,7 @@ impl PostgresSourceConfig {
     ///
     /// Returns an error if:
     /// - Database name is empty
-    /// - User is empty
+    /// - Neither identity_provider nor user is provided
     /// - Port is 0
     /// - Slot name is empty
     /// - Publication name is empty
@@ -135,10 +176,10 @@ impl PostgresSourceConfig {
             ));
         }
 
-        if self.user.is_empty() {
+        if self.identity_provider.is_none() && self.user.is_empty() {
             return Err(anyhow::anyhow!(
-                "Validation error: user cannot be empty. \
-                 Please specify the PostgreSQL user for replication"
+                "Validation error: either identity_provider or user must be provided. \
+                 Please specify the PostgreSQL user for replication or provide an identity provider"
             ));
         }
 

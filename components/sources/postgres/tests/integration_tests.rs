@@ -73,6 +73,7 @@ async fn build_core(
         host: config.host.clone(),
         port: config.port,
         database: config.database.clone(),
+        identity_provider: None,
         user: config.user.clone(),
         password: config.password.clone(),
         tables: vec![TEST_TABLE.to_string()],

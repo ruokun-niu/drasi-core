@@ -28,6 +28,7 @@ use super::types::{StandbyStatusUpdate, WalMessage};
 use super::PostgresSourceConfig;
 use drasi_core::models::{Element, ElementMetadata, ElementReference, SourceChange};
 use drasi_lib::channels::{ComponentEventSender, ComponentStatus, SourceEvent, SourceEventWrapper};
+use drasi_lib::identity::IdentityProvider;
 use drasi_lib::sources::base::SourceBase;
 
 pub struct ReplicationStream {
@@ -48,6 +49,7 @@ pub struct ReplicationStream {
     pending_transaction: Option<Vec<SourceChange>>,
     relations: HashMap<u32, RelationMapping>,
     table_primary_keys: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    identity_provider: Option<Arc<dyn IdentityProvider>>,
 }
 
 struct RelationMapping {
@@ -73,6 +75,7 @@ impl ReplicationStream {
         >,
         status_tx: Arc<RwLock<Option<ComponentEventSender>>>,
         status: Arc<RwLock<ComponentStatus>>,
+        identity_provider: Option<Arc<dyn IdentityProvider>>,
     ) -> Self {
         Self {
             config,
@@ -87,6 +90,7 @@ impl ReplicationStream {
             pending_transaction: None,
             relations: HashMap::new(),
             table_primary_keys: Arc::new(RwLock::new(HashMap::new())),
+            identity_provider,
         }
     }
 
@@ -158,13 +162,30 @@ impl ReplicationStream {
     async fn connect_and_setup(&mut self) -> Result<()> {
         info!("Connecting to PostgreSQL for replication");
 
+        // Resolve credentials: identity provider > config provider > user/password
+        let effective_provider = self.identity_provider.as_ref().map(|p| p.as_ref());
+        let config_provider = self.config.identity_provider.as_deref();
+        let provider = effective_provider.or(config_provider);
+
+        let (user, password) = if let Some(provider) = provider {
+            debug!("Using identity provider for authentication");
+            let context = drasi_lib::identity::CredentialContext::new()
+                .with_property("hostname", &self.config.host)
+                .with_property("port", self.config.port.to_string());
+            let credentials = provider.get_credentials(&context).await?;
+            credentials.into_auth_pair()
+        } else {
+            debug!("Using username/password for authentication");
+            (self.config.user.clone(), self.config.password.clone())
+        };
+
         // Create connection
         let mut conn = ReplicationConnection::connect(
             &self.config.host,
             self.config.port,
             &self.config.database,
-            &self.config.user,
-            &self.config.password,
+            &user,
+            &password,
         )
         .await?;
 

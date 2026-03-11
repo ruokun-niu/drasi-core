@@ -187,6 +187,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use drasi_lib::channels::{DispatchMode, *};
+use drasi_lib::identity::IdentityProvider;
 use drasi_lib::sources::base::{SourceBase, SourceBaseParams};
 use drasi_lib::Source;
 use tracing::Instrument;
@@ -353,6 +354,9 @@ impl Source for PostgresReplicationSource {
         let status_tx = self.base.status_tx();
         let status_clone = self.base.status.clone();
 
+        // Get identity provider from base (injected from runtime context or programmatic)
+        let identity_provider = self.base.identity_provider().await;
+
         // Get instance_id from context for log routing isolation
         let instance_id = self
             .base
@@ -378,6 +382,7 @@ impl Source for PostgresReplicationSource {
                     dispatchers,
                     status_tx.clone(),
                     status_clone.clone(),
+                    identity_provider,
                 )
                 .await
                 {
@@ -476,11 +481,12 @@ async fn run_replication(
     >,
     status_tx: Arc<RwLock<Option<ComponentEventSender>>>,
     status: Arc<RwLock<ComponentStatus>>,
+    identity_provider: Option<Arc<dyn IdentityProvider>>,
 ) -> Result<()> {
     info!("Starting replication for source {source_id}");
 
     let mut stream =
-        stream::ReplicationStream::new(config, source_id, dispatchers, status_tx, status);
+        stream::ReplicationStream::new(config, source_id, dispatchers, status_tx, status, identity_provider);
 
     stream.run().await
 }
@@ -520,6 +526,7 @@ pub struct PostgresSourceBuilder {
     dispatch_buffer_capacity: Option<usize>,
     bootstrap_provider: Option<Box<dyn drasi_lib::bootstrap::BootstrapProvider + 'static>>,
     auto_start: bool,
+    identity_provider: Option<Box<dyn IdentityProvider>>,
 }
 
 impl PostgresSourceBuilder {
@@ -541,6 +548,7 @@ impl PostgresSourceBuilder {
             dispatch_buffer_capacity: None,
             bootstrap_provider: None,
             auto_start: true,
+            identity_provider: None,
         }
     }
 
@@ -646,6 +654,19 @@ impl PostgresSourceBuilder {
         self
     }
 
+    /// Set the identity provider for authentication.
+    ///
+    /// When set, the identity provider takes precedence over user/password
+    /// for authenticating to PostgreSQL. Supports Azure AD, AWS IAM,
+    /// and other identity providers.
+    pub fn with_identity_provider(
+        mut self,
+        provider: impl IdentityProvider + 'static,
+    ) -> Self {
+        self.identity_provider = Some(Box::new(provider));
+        self
+    }
+
     /// Set the full configuration at once
     pub fn with_config(mut self, config: PostgresSourceConfig) -> Self {
         self.host = config.host;
@@ -658,6 +679,7 @@ impl PostgresSourceBuilder {
         self.publication_name = config.publication_name;
         self.ssl_mode = config.ssl_mode;
         self.table_keys = config.table_keys;
+        self.identity_provider = config.identity_provider;
         self
     }
 
@@ -671,6 +693,7 @@ impl PostgresSourceBuilder {
             host: self.host,
             port: self.port,
             database: self.database,
+            identity_provider: self.identity_provider,
             user: self.user,
             password: self.password,
             tables: self.tables,
@@ -733,6 +756,7 @@ mod tests {
                 host: "localhost".to_string(),
                 port: 5432,
                 database: "testdb".to_string(),
+                identity_provider: None,
                 user: "testuser".to_string(),
                 password: String::new(),
                 tables: Vec::new(),
@@ -933,6 +957,7 @@ mod tests {
                 host: "localhost".to_string(),
                 port: 5432,
                 database: "testdb".to_string(),
+                identity_provider: None,
                 user: "testuser".to_string(),
                 password: String::new(),
                 tables: Vec::new(),

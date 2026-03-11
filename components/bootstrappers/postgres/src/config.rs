@@ -17,6 +17,7 @@
 //! These types are defined locally to keep this component independent
 //! and self-contained, without dependencies on other components.
 
+use drasi_lib::identity::IdentityProvider;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -59,7 +60,7 @@ pub struct TableKeyConfig {
 }
 
 /// PostgreSQL bootstrap provider configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PostgresBootstrapConfig {
     /// PostgreSQL host
     #[serde(default = "default_postgres_host")]
@@ -72,7 +73,12 @@ pub struct PostgresBootstrapConfig {
     /// Database name
     pub database: String,
 
+    /// Identity provider for authentication (takes precedence over user/password)
+    #[serde(skip)]
+    pub identity_provider: Option<Box<dyn IdentityProvider>>,
+
     /// Database user
+    #[serde(default)]
     pub user: String,
 
     /// Database password
@@ -133,10 +139,10 @@ impl PostgresBootstrapConfig {
             ));
         }
 
-        if self.user.is_empty() {
+        if self.identity_provider.is_none() && self.user.is_empty() {
             return Err(anyhow::anyhow!(
-                "Validation error: user cannot be empty. \
-                 Please specify the PostgreSQL user"
+                "Validation error: either identity_provider or user must be provided. \
+                 Please specify the PostgreSQL user or provide an identity provider"
             ));
         }
 

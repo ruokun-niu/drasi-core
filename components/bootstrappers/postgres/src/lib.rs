@@ -40,6 +40,7 @@
 //!     host: "localhost".to_string(),
 //!     port: 5432,
 //!     database: "mydb".to_string(),
+//!     identity_provider: None,
 //!     user: "user".to_string(),
 //!     password: "password".to_string(),
 //!     tables: vec!["users".to_string()],

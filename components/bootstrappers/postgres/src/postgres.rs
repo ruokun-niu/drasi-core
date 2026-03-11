@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use drasi_core::models::{
     Element, ElementMetadata, ElementPropertyMap, ElementReference, SourceChange,
 };
+use drasi_lib::identity::IdentityProvider;
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -78,6 +79,7 @@ pub struct PostgresBootstrapProviderBuilder {
     publication_name: String,
     ssl_mode: SslMode,
     table_keys: Vec<TableKeyConfig>,
+    identity_provider: Option<Box<dyn IdentityProvider>>,
 }
 
 impl PostgresBootstrapProviderBuilder {
@@ -94,6 +96,7 @@ impl PostgresBootstrapProviderBuilder {
             publication_name: "drasi_pub".to_string(),
             ssl_mode: SslMode::Disable,
             table_keys: Vec::new(),
+            identity_provider: None,
         }
     }
 
@@ -172,12 +175,26 @@ impl PostgresBootstrapProviderBuilder {
         self
     }
 
+    /// Set the identity provider for authentication.
+    ///
+    /// When set, the identity provider takes precedence over user/password
+    /// for authenticating to PostgreSQL. Supports Azure AD, AWS IAM,
+    /// and other identity providers.
+    pub fn with_identity_provider(
+        mut self,
+        provider: impl IdentityProvider + 'static,
+    ) -> Self {
+        self.identity_provider = Some(Box::new(provider));
+        self
+    }
+
     /// Build the PostgresBootstrapProvider
     pub fn build(self) -> PostgresBootstrapProvider {
         let config = PostgresBootstrapConfig {
             host: self.host,
             port: self.port,
             database: self.database,
+            identity_provider: self.identity_provider,
             user: self.user,
             password: self.password,
             tables: self.tables,
@@ -229,11 +246,12 @@ impl BootstrapProvider for PostgresBootstrapProvider {
 }
 
 /// PostgreSQL configuration extracted from source properties
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct PostgresConfig {
     pub host: String,
     pub port: u16,
     pub database: String,
+    pub identity_provider: Option<Arc<dyn IdentityProvider>>,
     pub user: String,
     pub password: String,
     #[allow(dead_code)]
@@ -247,12 +265,34 @@ struct PostgresConfig {
     pub table_keys: Vec<TableKeyConfig>,
 }
 
+impl std::fmt::Debug for PostgresConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("identity_provider", &self.identity_provider.is_some())
+            .field("user", &self.user)
+            .field("password", &"***")
+            .field("tables", &self.tables)
+            .field("slot_name", &self.slot_name)
+            .field("publication_name", &self.publication_name)
+            .field("ssl_mode", &self.ssl_mode)
+            .field("table_keys", &self.table_keys)
+            .finish()
+    }
+}
+
 impl PostgresConfig {
     fn from_bootstrap_config(postgres_config: PostgresBootstrapConfig) -> Self {
+        let identity_provider = postgres_config
+            .identity_provider
+            .map(|ip| Arc::from(ip) as Arc<dyn IdentityProvider>);
         PostgresConfig {
             host: postgres_config.host.clone(),
             port: postgres_config.port,
             database: postgres_config.database.clone(),
+            identity_provider,
             user: postgres_config.user.clone(),
             password: postgres_config.password.clone(),
             tables: postgres_config.tables.clone(),
@@ -332,12 +372,25 @@ impl PostgresBootstrapHandler {
 
     /// Create a regular PostgreSQL connection
     async fn connect(&self) -> Result<Client> {
+        // Resolve credentials: identity provider > user/password
+        let (user, password) = if let Some(provider) = &self.config.identity_provider {
+            debug!("Using identity provider for bootstrap authentication");
+            let context = drasi_lib::identity::CredentialContext::new()
+                .with_property("hostname", &self.config.host)
+                .with_property("port", self.config.port.to_string());
+            let credentials = provider.get_credentials(&context).await?;
+            credentials.into_auth_pair()
+        } else {
+            debug!("Using username/password for bootstrap authentication");
+            (self.config.user.clone(), self.config.password.clone())
+        };
+
         let connection_string = format!(
             "host={} port={} user={} password={} dbname={}",
             self.config.host,
             self.config.port,
-            self.config.user,
-            self.config.password,
+            user,
+            password,
             self.config.database
         );
 

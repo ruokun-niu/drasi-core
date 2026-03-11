@@ -174,6 +174,7 @@ impl BootstrapPluginDescriptor for PostgresBootstrapDescriptor {
             host: mapper.resolve_string(&dto.host)?,
             port: mapper.resolve_typed(&dto.port)?,
             database: mapper.resolve_string(&dto.database)?,
+            identity_provider: None, // Injected from runtime context if needed
             user: mapper.resolve_string(&dto.user)?,
             password: mapper.resolve_string(&dto.password)?,
             tables: dto.tables,

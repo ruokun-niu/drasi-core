@@ -16,9 +16,10 @@ use anyhow::{anyhow, Result};
 use bytes::{Buf, BytesMut};
 use log::{debug, info, trace, warn};
 use std::collections::HashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use super::config::SslMode;
 use super::protocol::{
     parse_backend_message, AuthenticationMessage, BackendMessage, FrontendMessage, StartupMessage,
     TransactionStatus,
@@ -26,8 +27,12 @@ use super::protocol::{
 use super::scram::ScramClient;
 use super::types::{ReplicationSlotInfo, StandbyStatusUpdate};
 
+/// Combined async read+write trait for stream abstraction.
+trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncStream for T {}
+
 pub struct ReplicationConnection {
-    stream: TcpStream,
+    stream: Box<dyn AsyncStream>,
     read_buffer: BytesMut,
     write_buffer: BytesMut,
     parameters: HashMap<String, String>,
@@ -44,11 +49,64 @@ impl ReplicationConnection {
         database: &str,
         user: &str,
         password: &str,
+        ssl_mode: SslMode,
     ) -> Result<Self> {
-        info!("Connecting to PostgreSQL at {host}:{port}");
+        info!("Connecting to PostgreSQL at {host}:{port} (ssl_mode={ssl_mode})");
 
-        let stream = TcpStream::connect((host, port)).await?;
-        stream.set_nodelay(true)?;
+        let mut tcp_stream = TcpStream::connect((host, port)).await?;
+        tcp_stream.set_nodelay(true)?;
+
+        // Negotiate SSL/TLS if needed
+        let stream: Box<dyn AsyncStream> = match ssl_mode {
+            SslMode::Disable => {
+                debug!("SSL disabled, using plain TCP");
+                Box::new(tcp_stream)
+            }
+            SslMode::Prefer | SslMode::Require => {
+                // Send SSLRequest message
+                // Format: 4-byte length (8) + 4-byte SSL request code (80877103)
+                let ssl_request: [u8; 8] = [0x00, 0x00, 0x00, 0x08, 0x04, 0xD2, 0x16, 0x2F];
+                tcp_stream.write_all(&ssl_request).await?;
+                tcp_stream.flush().await?;
+
+                // Read server response (single byte)
+                let mut response = [0u8; 1];
+                tcp_stream.read_exact(&mut response).await?;
+
+                match response[0] {
+                    b'S' => {
+                        debug!("Server accepted SSL, upgrading connection");
+                        let tls_connector = native_tls::TlsConnector::builder()
+                            .danger_accept_invalid_certs(false)
+                            .danger_accept_invalid_hostnames(false)
+                            .build()
+                            .map_err(|e| anyhow!("Failed to create TLS connector: {e}"))?;
+
+                        let connector = tokio_native_tls::TlsConnector::from(tls_connector);
+                        let tls_stream = connector.connect(host, tcp_stream).await
+                            .map_err(|e| anyhow!("TLS handshake failed: {e}"))?;
+
+                        info!("TLS connection established to {host}:{port}");
+                        Box::new(tls_stream) as Box<dyn AsyncStream>
+                    }
+                    b'N' => {
+                        if ssl_mode == SslMode::Require {
+                            return Err(anyhow!(
+                                "Server does not support SSL but ssl_mode=require"
+                            ));
+                        }
+                        debug!("Server declined SSL, continuing with plain TCP");
+                        Box::new(tcp_stream)
+                    }
+                    other => {
+                        return Err(anyhow!(
+                            "Unexpected SSL response from server: 0x{:02X}",
+                            other
+                        ));
+                    }
+                }
+            }
+        };
 
         let mut conn = Self {
             stream,

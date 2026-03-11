@@ -186,6 +186,7 @@ impl ReplicationStream {
             &self.config.database,
             &user,
             &password,
+            self.config.ssl_mode,
         )
         .await?;
 

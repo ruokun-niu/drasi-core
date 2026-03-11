@@ -21,6 +21,7 @@ use drasi_core::models::{
 };
 use drasi_lib::identity::IdentityProvider;
 use log::{debug, error, info, warn};
+use postgres_native_tls::MakeTlsConnector;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_postgres::{Client, NoTls, Row, Transaction};
@@ -386,22 +387,45 @@ impl PostgresBootstrapHandler {
         };
 
         let connection_string = format!(
-            "host={} port={} user={} password={} dbname={}",
+            "host={} port={} user={} password={} dbname={} sslmode={}",
             self.config.host,
             self.config.port,
             user,
             password,
-            self.config.database
+            self.config.database,
+            self.config.ssl_mode
         );
 
-        let (client, connection) = tokio_postgres::connect(&connection_string, NoTls).await?;
-
-        // Spawn connection handler
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                error!("PostgreSQL connection error: {e}");
+        let client = match self.config.ssl_mode {
+            SslMode::Disable => {
+                debug!("Bootstrap: Connecting without SSL");
+                let (client, connection) =
+                    tokio_postgres::connect(&connection_string, NoTls).await?;
+                tokio::spawn(async move {
+                    if let Err(e) = connection.await {
+                        error!("PostgreSQL connection error: {e}");
+                    }
+                });
+                client
             }
-        });
+            SslMode::Prefer | SslMode::Require => {
+                debug!("Bootstrap: Connecting with SSL (mode={})", self.config.ssl_mode);
+                let tls_connector = native_tls::TlsConnector::builder()
+                    .danger_accept_invalid_certs(false)
+                    .danger_accept_invalid_hostnames(false)
+                    .build()
+                    .map_err(|e| anyhow!("Failed to create TLS connector: {e}"))?;
+                let connector = MakeTlsConnector::new(tls_connector);
+                let (client, connection) =
+                    tokio_postgres::connect(&connection_string, connector).await?;
+                tokio::spawn(async move {
+                    if let Err(e) = connection.await {
+                        error!("PostgreSQL connection error: {e}");
+                    }
+                });
+                client
+            }
+        };
 
         Ok(client)
     }

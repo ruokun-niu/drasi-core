@@ -90,6 +90,7 @@ async fn build_core(
         host: source_config.host.clone(),
         port: source_config.port,
         database: source_config.database.clone(),
+        identity_provider: None,
         user: source_config.user.clone(),
         password: source_config.password.clone(),
         tables: source_config.tables.clone(),

@@ -168,14 +168,14 @@ impl ReplicationStream {
         let provider = effective_provider.or(config_provider);
 
         let (user, password) = if let Some(provider) = provider {
-            debug!("Using identity provider for authentication");
+            debug!("Using identity provider for replication authentication");
             let context = drasi_lib::identity::CredentialContext::new()
                 .with_property("hostname", &self.config.host)
                 .with_property("port", self.config.port.to_string());
             let credentials = provider.get_credentials(&context).await?;
             credentials.into_auth_pair()
         } else {
-            debug!("Using username/password for authentication");
+            debug!("Using username/password for replication authentication");
             (self.config.user.clone(), self.config.password.clone())
         };
 

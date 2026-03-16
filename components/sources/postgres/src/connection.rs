@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use anyhow::{anyhow, Result};
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, info, trace, warn};
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -26,6 +26,7 @@ use super::protocol::{
 };
 use super::scram::ScramClient;
 use super::types::{ReplicationSlotInfo, StandbyStatusUpdate};
+use postgres_protocol::authentication::sasl::ChannelBinding;
 
 /// Combined async read+write trait for stream abstraction.
 trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
@@ -40,6 +41,10 @@ pub struct ReplicationConnection {
     secret_key: Option<i32>,
     transaction_status: TransactionStatus,
     in_copy_mode: bool,
+    /// TLS channel binding data (`tls-server-end-point` hash of the server cert).
+    /// `Some(data)` when TLS is active and the peer certificate was available;
+    /// `None` when TLS is not active or the peer cert could not be extracted.
+    tls_server_end_point: Option<Vec<u8>>,
 }
 
 impl ReplicationConnection {
@@ -57,56 +62,73 @@ impl ReplicationConnection {
         tcp_stream.set_nodelay(true)?;
 
         // Negotiate SSL/TLS if needed
-        let stream: Box<dyn AsyncStream> = match ssl_mode {
-            SslMode::Disable => {
-                debug!("SSL disabled, using plain TCP");
-                Box::new(tcp_stream)
-            }
-            SslMode::Prefer | SslMode::Require => {
-                // Send SSLRequest message
-                // Format: 4-byte length (8) + 4-byte SSL request code (80877103)
-                let ssl_request: [u8; 8] = [0x00, 0x00, 0x00, 0x08, 0x04, 0xD2, 0x16, 0x2F];
-                tcp_stream.write_all(&ssl_request).await?;
-                tcp_stream.flush().await?;
+        let (stream, tls_server_end_point): (Box<dyn AsyncStream>, Option<Vec<u8>>) =
+            match ssl_mode {
+                SslMode::Disable => {
+                    debug!("SSL disabled, using plain TCP");
+                    (Box::new(tcp_stream), None)
+                }
+                SslMode::Prefer | SslMode::Require => {
+                    // Send SSLRequest message
+                    let ssl_request: [u8; 8] =
+                        [0x00, 0x00, 0x00, 0x08, 0x04, 0xD2, 0x16, 0x2F];
+                    tcp_stream.write_all(&ssl_request).await?;
+                    tcp_stream.flush().await?;
 
-                // Read server response (single byte)
-                let mut response = [0u8; 1];
-                tcp_stream.read_exact(&mut response).await?;
+                    let mut response = [0u8; 1];
+                    tcp_stream.read_exact(&mut response).await?;
 
-                match response[0] {
-                    b'S' => {
-                        debug!("Server accepted SSL, upgrading connection");
-                        let tls_connector = native_tls::TlsConnector::builder()
-                            .danger_accept_invalid_certs(false)
-                            .danger_accept_invalid_hostnames(false)
-                            .build()
-                            .map_err(|e| anyhow!("Failed to create TLS connector: {e}"))?;
+                    match response[0] {
+                        b'S' => {
+                            debug!("Server accepted SSL, upgrading connection");
+                            let tls_connector = native_tls::TlsConnector::builder()
+                                .danger_accept_invalid_certs(false)
+                                .danger_accept_invalid_hostnames(false)
+                                .build()
+                                .map_err(|e| anyhow!("Failed to create TLS connector: {e}"))?;
 
-                        let connector = tokio_native_tls::TlsConnector::from(tls_connector);
-                        let tls_stream = connector.connect(host, tcp_stream).await
-                            .map_err(|e| anyhow!("TLS handshake failed: {e}"))?;
+                            let connector =
+                                tokio_native_tls::TlsConnector::from(tls_connector);
+                            let tls_stream = connector
+                                .connect(host, tcp_stream)
+                                .await
+                                .map_err(|e| anyhow!("TLS handshake failed: {e}"))?;
 
-                        info!("TLS connection established to {host}:{port}");
-                        Box::new(tls_stream) as Box<dyn AsyncStream>
-                    }
-                    b'N' => {
-                        if ssl_mode == SslMode::Require {
+                            // Extract tls-server-end-point channel binding data
+                            let cb_data =
+                                tls_stream.get_ref().tls_server_end_point().ok().flatten();
+                            if cb_data.is_some() {
+                                debug!(
+                                    "Extracted tls-server-end-point channel binding data ({} bytes)",
+                                    cb_data.as_ref().unwrap().len()
+                                );
+                            } else {
+                                debug!(
+                                    "Could not extract tls-server-end-point (peer cert unavailable)"
+                                );
+                            }
+
+                            info!("TLS connection established to {host}:{port}");
+                            (Box::new(tls_stream) as Box<dyn AsyncStream>, cb_data)
+                        }
+                        b'N' => {
+                            if ssl_mode == SslMode::Require {
+                                return Err(anyhow!(
+                                    "Server does not support SSL but ssl_mode=require"
+                                ));
+                            }
+                            debug!("Server declined SSL, continuing with plain TCP");
+                            (Box::new(tcp_stream), None)
+                        }
+                        other => {
                             return Err(anyhow!(
-                                "Server does not support SSL but ssl_mode=require"
+                                "Unexpected SSL response from server: 0x{:02X}",
+                                other
                             ));
                         }
-                        debug!("Server declined SSL, continuing with plain TCP");
-                        Box::new(tcp_stream)
-                    }
-                    other => {
-                        return Err(anyhow!(
-                            "Unexpected SSL response from server: 0x{:02X}",
-                            other
-                        ));
                     }
                 }
-            }
-        };
+            };
 
         let mut conn = Self {
             stream,
@@ -117,6 +139,7 @@ impl ReplicationConnection {
             secret_key: None,
             transaction_status: TransactionStatus::Idle,
             in_copy_mode: false,
+            tls_server_end_point,
         };
 
         conn.startup_replication(database, user, password).await?;
@@ -161,51 +184,95 @@ impl ReplicationConnection {
                             ));
                         }
                         AuthenticationMessage::SASL(mechanisms) => {
-                            if mechanisms.contains(&"SCRAM-SHA-256".to_string()) {
-                                debug!("Server requested SCRAM-SHA-256 authentication");
-                                let mut scram_client = ScramClient::new(user, password);
+                            debug!("Server offered SASL mechanisms: {mechanisms:?}");
 
-                                // Send SASLInitialResponse
-                                let client_first = scram_client.client_first_message();
-                                self.send_sasl_initial_response("SCRAM-SHA-256", &client_first)
-                                    .await?;
+                            let has_scram =
+                                mechanisms.contains(&"SCRAM-SHA-256".to_string());
+                            let has_scram_plus =
+                                mechanisms.contains(&"SCRAM-SHA-256-PLUS".to_string());
 
-                                // Continue SASL exchange
-                                loop {
-                                    let sasl_msg = self.read_message().await?;
-                                    match sasl_msg {
-                                        BackendMessage::Authentication(
-                                            AuthenticationMessage::SASLContinue(data),
-                                        ) => {
-                                            let server_first = String::from_utf8_lossy(&data);
-                                            scram_client
-                                                .process_server_first_message(&server_first)?;
-
-                                            let client_final =
-                                                scram_client.client_final_message()?;
-                                            self.send_sasl_response(&client_final).await?;
-                                        }
-                                        BackendMessage::Authentication(
-                                            AuthenticationMessage::SASLFinal(data),
-                                        ) => {
-                                            let server_final = String::from_utf8_lossy(&data);
-                                            scram_client.verify_server_final(&server_final)?;
-                                            debug!("SCRAM-SHA-256 authentication successful");
-                                            break;
-                                        }
-                                        BackendMessage::ErrorResponse(err) => {
-                                            return Err(anyhow!(
-                                                "SASL authentication failed: {}",
-                                                err.message
-                                            ));
-                                        }
-                                        _ => {
-                                            warn!("Unexpected message during SASL: {sasl_msg:?}");
-                                        }
+                            let (channel_binding, mechanism) = if has_scram_plus {
+                                match &self.tls_server_end_point {
+                                    Some(data) => {
+                                        debug!("Using SCRAM-SHA-256-PLUS with tls-server-end-point");
+                                        (
+                                            ChannelBinding::tls_server_end_point(data.clone()),
+                                            "SCRAM-SHA-256-PLUS",
+                                        )
+                                    }
+                                    None => {
+                                        debug!("Server offered SCRAM-SHA-256-PLUS but no CB data; falling back to SCRAM-SHA-256");
+                                        (ChannelBinding::unsupported(), "SCRAM-SHA-256")
+                                    }
+                                }
+                            } else if has_scram {
+                                match &self.tls_server_end_point {
+                                    Some(_) => {
+                                        debug!("Using SCRAM-SHA-256 with CB unrequested (y,,)");
+                                        (ChannelBinding::unrequested(), "SCRAM-SHA-256")
+                                    }
+                                    None => {
+                                        debug!("Using SCRAM-SHA-256 without CB (n,,)");
+                                        (ChannelBinding::unsupported(), "SCRAM-SHA-256")
                                     }
                                 }
                             } else {
-                                return Err(anyhow!("No supported SASL mechanisms"));
+                                return Err(anyhow!(
+                                    "No supported SASL mechanisms in: {mechanisms:?}"
+                                ));
+                            };
+
+                            debug!("Password/token length: {} bytes", password.len());
+                            let mut scram_client =
+                                ScramClient::new(user, password, channel_binding);
+
+                            // Send SASLInitialResponse
+                            let client_first = scram_client.client_first_message();
+                            debug!(
+                                "SCRAM client-first-message ({} bytes): {:?}",
+                                client_first.len(),
+                                String::from_utf8_lossy(&client_first)
+                            );
+                            self.send_sasl_initial_response_bytes(mechanism, &client_first)
+                                .await?;
+
+                            // Continue SASL exchange
+                            loop {
+                                let sasl_msg = self.read_message().await?;
+                                match sasl_msg {
+                                    BackendMessage::Authentication(
+                                        AuthenticationMessage::SASLContinue(data),
+                                    ) => {
+                                        debug!(
+                                            "SCRAM server-first-message ({} bytes)",
+                                            data.len()
+                                        );
+                                        scram_client
+                                            .process_server_first_message(&data)?;
+                                        let client_final =
+                                            scram_client.client_final_message();
+                                        self.send_sasl_response_bytes(&client_final)
+                                            .await?;
+                                    }
+                                    BackendMessage::Authentication(
+                                        AuthenticationMessage::SASLFinal(data),
+                                    ) => {
+                                        scram_client.verify_server_final(&data)?;
+                                        debug!("SCRAM authentication successful");
+                                        break;
+                                    }
+                                    BackendMessage::ErrorResponse(err) => {
+                                        return Err(anyhow!(
+                                            "SASL authentication failed: {}",
+                                            err.message
+                                        ));
+                                    }
+                                    _ => {
+                                        warn!(
+                                            "Unexpected message during SASL: {sasl_msg:?}"
+                                        );
+                                    }
+                                }
                             }
                         }
                         _ => {
@@ -269,41 +336,28 @@ impl ReplicationConnection {
         loop {
             let msg = self.read_message().await?;
             match msg {
-                BackendMessage::RowDescription(_) => {
-                    // Skip row description
-                }
+                BackendMessage::RowDescription(_) => {}
                 BackendMessage::DataRow(row) => {
-                    // Parse system identification
                     if row.len() >= 4 {
-                        if let Some(Some(systemid)) = row.first() {
-                            system_info.insert(
-                                "systemid".to_string(),
-                                String::from_utf8_lossy(systemid).to_string(),
-                            );
+                        if let Some(Some(v)) = row.first() {
+                            system_info
+                                .insert("systemid".into(), String::from_utf8_lossy(v).into());
                         }
-                        if let Some(Some(timeline)) = row.get(1) {
-                            system_info.insert(
-                                "timeline".to_string(),
-                                String::from_utf8_lossy(timeline).to_string(),
-                            );
+                        if let Some(Some(v)) = row.get(1) {
+                            system_info
+                                .insert("timeline".into(), String::from_utf8_lossy(v).into());
                         }
-                        if let Some(Some(xlogpos)) = row.get(2) {
-                            system_info.insert(
-                                "xlogpos".to_string(),
-                                String::from_utf8_lossy(xlogpos).to_string(),
-                            );
+                        if let Some(Some(v)) = row.get(2) {
+                            system_info
+                                .insert("xlogpos".into(), String::from_utf8_lossy(v).into());
                         }
-                        if let Some(Some(dbname)) = row.get(3) {
-                            system_info.insert(
-                                "dbname".to_string(),
-                                String::from_utf8_lossy(dbname).to_string(),
-                            );
+                        if let Some(Some(v)) = row.get(3) {
+                            system_info
+                                .insert("dbname".into(), String::from_utf8_lossy(v).into());
                         }
                     }
                 }
-                BackendMessage::CommandComplete(_) => {
-                    // Command completed
-                }
+                BackendMessage::CommandComplete(_) => {}
                 BackendMessage::ReadyForQuery(status) => {
                     self.transaction_status = status;
                     break;
@@ -345,25 +399,20 @@ impl ReplicationConnection {
         loop {
             let msg = self.read_message().await?;
             match msg {
-                BackendMessage::RowDescription(_) => {
-                    // Skip row description
-                }
+                BackendMessage::RowDescription(_) => {}
                 BackendMessage::DataRow(row) => {
-                    // Parse slot creation result
                     if row.len() >= 4 {
-                        if let Some(Some(consistent_point)) = row.get(1) {
+                        if let Some(Some(cp)) = row.get(1) {
                             slot_info.consistent_point =
-                                String::from_utf8_lossy(consistent_point).to_string();
+                                String::from_utf8_lossy(cp).to_string();
                         }
-                        if let Some(Some(snapshot_name)) = row.get(2) {
+                        if let Some(Some(sn)) = row.get(2) {
                             slot_info.snapshot_name =
-                                Some(String::from_utf8_lossy(snapshot_name).to_string());
+                                Some(String::from_utf8_lossy(sn).to_string());
                         }
                     }
                 }
-                BackendMessage::CommandComplete(_) => {
-                    // Command completed
-                }
+                BackendMessage::CommandComplete(_) => {}
                 BackendMessage::ReadyForQuery(status) => {
                     self.transaction_status = status;
                     break;
@@ -371,7 +420,6 @@ impl ReplicationConnection {
                 BackendMessage::ErrorResponse(err) => {
                     if err.message.contains("already exists") {
                         debug!("Replication slot already exists: {slot_name}");
-                        // Drain the ReadyForQuery that PostgreSQL sends after ErrorResponse
                         loop {
                             let drain_msg = self.read_message().await?;
                             if let BackendMessage::ReadyForQuery(status) = drain_msg {
@@ -400,7 +448,8 @@ impl ReplicationConnection {
 
         let slot_name_escaped = slot_name.replace('\'', "''");
         let query = format!(
-            "SELECT slot_name, confirmed_flush_lsn, restart_lsn, plugin FROM pg_replication_slots WHERE slot_name = '{slot_name_escaped}'"
+            "SELECT slot_name, confirmed_flush_lsn, restart_lsn, plugin \
+             FROM pg_replication_slots WHERE slot_name = '{slot_name_escaped}'"
         );
 
         self.send_message(FrontendMessage::Query(query)).await?;
@@ -416,40 +465,40 @@ impl ReplicationConnection {
         loop {
             let msg = self.read_message().await?;
             match msg {
-                BackendMessage::RowDescription(_) => {
-                    // Skip row description
-                }
+                BackendMessage::RowDescription(_) => {}
                 BackendMessage::DataRow(row) => {
                     found_row = true;
                     if row.len() >= 4 {
-                        if let Some(Some(confirmed_flush_lsn)) = row.get(1) {
-                            let lsn = String::from_utf8_lossy(confirmed_flush_lsn).to_string();
+                        if let Some(Some(v)) = row.get(1) {
+                            let lsn = String::from_utf8_lossy(v).to_string();
                             if !lsn.is_empty() {
                                 slot_info.consistent_point = lsn;
                             }
                         }
                         if slot_info.consistent_point == "0/0" {
-                            if let Some(Some(restart_lsn)) = row.get(2) {
-                                let lsn = String::from_utf8_lossy(restart_lsn).to_string();
+                            if let Some(Some(v)) = row.get(2) {
+                                let lsn = String::from_utf8_lossy(v).to_string();
                                 if !lsn.is_empty() {
                                     slot_info.consistent_point = lsn;
                                 }
                             }
                         }
-                        if let Some(Some(plugin)) = row.get(3) {
-                            slot_info.output_plugin = String::from_utf8_lossy(plugin).to_string();
+                        if let Some(Some(v)) = row.get(3) {
+                            slot_info.output_plugin =
+                                String::from_utf8_lossy(v).to_string();
                         }
                     }
                 }
-                BackendMessage::CommandComplete(_) => {
-                    // Command completed
-                }
+                BackendMessage::CommandComplete(_) => {}
                 BackendMessage::ReadyForQuery(status) => {
                     self.transaction_status = status;
                     break;
                 }
                 BackendMessage::ErrorResponse(err) => {
-                    return Err(anyhow!("Failed to query replication slot: {}", err.message));
+                    return Err(anyhow!(
+                        "Failed to query replication slot: {}",
+                        err.message
+                    ));
                 }
                 _ => {
                     warn!("Unexpected message during slot query: {msg:?}");
@@ -486,7 +535,8 @@ impl ReplicationConnection {
 
         if !options.is_empty() {
             query.push_str(" (");
-            let opts: Vec<String> = options.iter().map(|(k, v)| format!("{k} '{v}'")).collect();
+            let opts: Vec<String> =
+                options.iter().map(|(k, v)| format!("{k} '{v}'")).collect();
             query.push_str(&opts.join(", "));
             query.push(')');
         }
@@ -506,7 +556,6 @@ impl ReplicationConnection {
                     return Err(anyhow!("START_REPLICATION failed: {}", err.message));
                 }
                 BackendMessage::ReadyForQuery(_) => {
-                    // This is normal - PostgreSQL sends ReadyForQuery before entering COPY mode
                     debug!("Received ReadyForQuery before entering COPY mode");
                 }
                 _ => {
@@ -531,7 +580,7 @@ impl ReplicationConnection {
             return Err(anyhow!("Not in COPY mode"));
         }
 
-        let timestamp = chrono::Utc::now().timestamp_micros() - 946684800000000; // PostgreSQL epoch
+        let timestamp = chrono::Utc::now().timestamp_micros() - 946_684_800_000_000;
 
         self.send_message(FrontendMessage::StandbyStatusUpdate {
             write_lsn: status.write_lsn,
@@ -554,28 +603,30 @@ impl ReplicationConnection {
         Ok(())
     }
 
-    async fn send_sasl_initial_response(&mut self, mechanism: &str, response: &str) -> Result<()> {
+    async fn send_sasl_initial_response_bytes(
+        &mut self,
+        mechanism: &str,
+        data: &[u8],
+    ) -> Result<()> {
         self.send_message(FrontendMessage::SASLInitialResponse {
             mechanism: mechanism.to_string(),
-            data: response.as_bytes().to_vec(),
+            data: data.to_vec(),
         })
         .await
     }
 
-    async fn send_sasl_response(&mut self, response: &str) -> Result<()> {
-        self.send_message(FrontendMessage::SASLResponse(response.as_bytes().to_vec()))
+    async fn send_sasl_response_bytes(&mut self, data: &[u8]) -> Result<()> {
+        self.send_message(FrontendMessage::SASLResponse(data.to_vec()))
             .await
     }
 
     async fn read_message(&mut self) -> Result<BackendMessage> {
         loop {
-            // Try to parse a message from the buffer
             if let Some(msg) = self.try_parse_message()? {
                 trace!("Received message: {msg:?}");
                 return Ok(msg);
             }
 
-            // Read more data
             let mut temp_buf = vec![0u8; 4096];
             let n = self.stream.read(&mut temp_buf).await?;
             if n == 0 {
@@ -588,7 +639,7 @@ impl ReplicationConnection {
 
     fn try_parse_message(&mut self) -> Result<Option<BackendMessage>> {
         if self.read_buffer.len() < 5 {
-            return Ok(None); // Need at least type + length
+            return Ok(None);
         }
 
         let msg_type = self.read_buffer[0];
@@ -603,17 +654,15 @@ impl ReplicationConnection {
             return Err(anyhow!("Invalid message length: {length}"));
         }
 
-        let total_length = 1 + length; // Type byte + length (includes self)
+        let total_length = 1 + length;
 
         if self.read_buffer.len() < total_length {
-            return Ok(None); // Need more data
+            return Ok(None);
         }
 
-        // Extract message
         let body = self.read_buffer[5..total_length].to_vec();
         self.read_buffer.advance(total_length);
 
-        // Parse message
         let msg = parse_backend_message(msg_type, &body)?;
         Ok(Some(msg))
     }

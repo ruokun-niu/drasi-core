@@ -16,4 +16,4 @@ jobs:
             --ref centralized-workflows \
             -f issue_url="${{ github.event.issue.html_url }}"
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.ORG_DISPATCH_TOKEN }}

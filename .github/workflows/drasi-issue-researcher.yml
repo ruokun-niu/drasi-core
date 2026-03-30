@@ -11,7 +11,7 @@ jobs:
     steps:
       - name: Trigger researcher
         run: |
-          gh workflow run drasi-issue-researcher.md \
+          gh workflow run drasi-issue-researcher.lock.yml \
             --repo drasi-project/.github \
             -f issue_url="${{ github.event.issue.html_url }}"
         env:

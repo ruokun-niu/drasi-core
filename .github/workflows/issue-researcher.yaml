@@ -13,7 +13,7 @@ jobs:
         run: |
           gh workflow run drasi-issue-researcher.lock.yml \
             --repo "drasi-project/.github" \
-            --ref "centralized-workflows"
+            --ref "centralized-workflows" \
             --field issue_url="${{ github.event.issue.html_url }}"
         env:
           GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}

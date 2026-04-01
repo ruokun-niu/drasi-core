@@ -6,7 +6,7 @@ on:
 
 jobs:
   trigger-research:
-    if: github.event.label.name == 'need-research'
+    if: github.event.label.name == 'needs-research'
     runs-on: ubuntu-latest
     steps:
       - name: Trigger drasi-issue-researcher workflow

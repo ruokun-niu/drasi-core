@@ -12,7 +12,7 @@ jobs:
       - name: Trigger drasi-issue-researcher workflow
         run: |
           gh workflow run drasi-issue-researcher.lock.yml \
-            --repo "${{ github.repository_owner }}/.github" \
+            --repo "drasi-project/.github" \
             --field issue_url="${{ github.event.issue.html_url }}"
         env:
           GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}

@@ -10,4 +10,3 @@ jobs:
     uses: drasi-project/.github/.github/workflows/drasi-issue-researcher.lock.yml@centralized-workflows
     with:
       issue_url: ${{ github.event.issue.html_url }}
-    secrets: inherit

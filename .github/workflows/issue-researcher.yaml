@@ -5,9 +5,28 @@ on:
     types: [labeled]
 
 jobs:
-  research:
+  trigger-research:
     if: github.event.label.name == 'needs-research'
-    uses: drasi-project/.github/.github/workflows/drasi-issue-researcher.lock.yml@centralized-workflows
-    with:
-      issue_url: ${{ github.event.issue.html_url }}
-    secrets: inherit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger drasi-issue-researcher workflow
+        run: |
+          gh workflow run drasi-issue-researcher.lock.yml \
+            --repo "drasi-project/.github" \
+            --ref "centralized-workflows" \
+            --field issue_url="${{ github.event.issue.html_url }}"
+        env:
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+# name: Trigger Issue Research
+
+# on:
+#   issues:
+#     types: [labeled]
+
+# jobs:
+#   research:
+#     if: github.event.label.name == 'needs-research'
+#     uses: drasi-project/.github/.github/workflows/drasi-issue-researcher.lock.yml@centralized-workflows
+#     with:
+#       issue_url: ${{ github.event.issue.html_url }}
+#     secrets: inherit

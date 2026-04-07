@@ -1,22 +1,3 @@
-# name: Trigger Issue Research
-
-# on:
-#   issues:
-#     types: [labeled]
-
-# jobs:
-#   trigger-research:
-#     if: github.event.label.name == 'needs-research'
-#     runs-on: ubuntu-latest
-#     steps:
-#       - name: Trigger drasi-issue-researcher workflow
-#         run: |
-#           gh workflow run drasi-issue-researcher.lock.yml \
-#             --repo "drasi-project/.github" \
-#             --ref "centralized-workflows" \
-#             --field issue_url="${{ github.event.issue.html_url }}"
-#         env:
-#           GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
 name: Trigger Issue Research
 
 on:
@@ -26,7 +7,7 @@ on:
 jobs:
   research:
     if: github.event.label.name == 'needs-research'
-    uses: drasi-project/.github/.github/workflows/drasi-issue-researcher.lock.yml@centralized-workflows
+    uses: drasi-project/.github/.github/workflows/drasi-issue-researcher.lock.yml@main
     with:
       issue_url: ${{ github.event.issue.html_url }}
     secrets: inherit

@@ -9,9 +9,8 @@ on:
     branches:
       - main
       - feature/*
-      - feature-lib
       - release/*
 
 jobs:
   lint:
-    uses: drasi-project/.github/.github/workflows/rust-lint.yaml@centralized-workflows
+    uses: drasi-project/.github/.github/workflows/rust-lint.yaml@main

@@ -11,14 +11,6 @@ extend-exclude = [
     "dump.rdb",
 ]
 
-[default]
-# Only check comments and doc-comments in code files (not identifiers)
-check-code = false
-
-[type.md]
-# Check all text in markdown files
-check-code = true
-
 [default.extend-words]
 AKS = "AKS"
 ba = "ba"

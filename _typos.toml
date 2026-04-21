@@ -1,0 +1,24 @@
+# Typos spell checker configuration
+# https://github.com/crate-ci/typos/blob/master/docs/reference.md
+
+[files]
+# Check Rust source files (comments, identifiers, strings) and markdown/README files
+extend-exclude = [
+    "target/",
+    "Cargo.lock",
+    "*.snap",
+    "test-data/",
+    "dump.rdb",
+]
+
+[default]
+# Only check comments and doc-comments in code files (not identifiers)
+check-code = false
+
+[type.md]
+# Check all text in markdown files
+check-code = true
+
+[default.extend-words]
+AKS = "AKS"
+ba = "ba"

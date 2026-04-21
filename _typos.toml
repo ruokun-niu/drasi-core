@@ -14,3 +14,9 @@ extend-exclude = [
 [default.extend-words]
 AKS = "AKS"
 ba = "ba"
+seh = "seh"
+SEH = "SEH"
+socal = "socal"
+Hashi = "Hashi"
+WHER = "WHER"
+UPDAT = "UPDAT"

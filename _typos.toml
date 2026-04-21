@@ -9,6 +9,7 @@ extend-exclude = [
     "*.snap",
     "test-data/",
     "dump.rdb",
+    "components/host-sdk/src/registry/cosign.rs",
 ]
 
 [default.extend-words]

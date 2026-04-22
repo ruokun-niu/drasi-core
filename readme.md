@@ -1,6 +1,7 @@
 # Drasi Core
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/10588/badge)](https://www.bestpractices.dev/projects/10588)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/drasi-project/drasi-core/badge)](https://scorecard.dev/viewer/?uri=github.com/drasi-project/drasi-core)
+[![Coverage Status](https://coveralls.io/repos/github/drasi-project/drasi-core/badge.svg?branch=main)](https://coveralls.io/github/drasi-project/drasi-core?branch=main)
 
 Drasi-core is the library used by [Drasi](https://github.com/drasi-project/drasi-platform) to implement continuous queries.
 

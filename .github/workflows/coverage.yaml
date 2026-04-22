@@ -192,7 +192,6 @@ jobs:
             -p drasi-bootstrap-postgres \
             -p drasi-bootstrap-application \
             -p drasi-plugin-sdk \
-            -p drasi-host-sdk \
             --lcov --output-path plugins-lcov.info
 
       - name: Upload plugin coverage to Coveralls

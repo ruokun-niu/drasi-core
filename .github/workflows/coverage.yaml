@@ -121,7 +121,6 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           file: core-lcov.info
           flag-name: core
-          parallel: true
 
   plugin-coverage:
     name: Plugin Coverage
@@ -200,16 +199,3 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           file: plugins-lcov.info
           flag-name: plugins
-          parallel: true
-
-  coverage-finalize:
-    name: Finalize Coverage
-    needs: [core-coverage, plugin-coverage]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Finalize Coveralls
-        uses: coverallsapp/github-action@648a8eb78e6d50909eff900e4ec85cab4524a45b # v2.3.6
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          parallel-finished: true

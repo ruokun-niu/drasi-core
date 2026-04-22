@@ -15,6 +15,11 @@
 name: Generate Rust Code Coverage
 
 on:
+  push:
+    branches:
+      - main
+      - improve-drasi-core
+
   pull_request:
     branches:
       - main

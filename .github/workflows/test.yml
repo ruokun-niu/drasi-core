@@ -2,9 +2,6 @@ name: Run Tests
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - improve-drasi-core
   pull_request:
     branches:
       - main

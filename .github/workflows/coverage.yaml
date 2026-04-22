@@ -15,10 +15,6 @@
 name: Generate Rust Code Coverage
 
 on:
-  workflow_dispatch:
-  push:
-    branches:
-      - improve-drasi-core
   pull_request:
     branches:
       - main
@@ -35,7 +31,7 @@ jobs:
   core-coverage:
     name: Core Coverage
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-8-cores
     permissions:
       contents: read
     services:
@@ -125,7 +121,7 @@ jobs:
   plugin-coverage:
     name: Plugin Coverage
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-8-cores
     permissions:
       contents: read
     services:

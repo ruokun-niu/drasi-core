@@ -152,6 +152,16 @@ async fn dispatch_query_results(
     dispatchers: &RwLock<Vec<Box<dyn ChangeDispatcher<QueryResult> + Send + Sync>>>,
     profiling: crate::profiling::ProfilingMetadata,
 ) {
+    // POC tracing: open a `query.dispatch` span (child of whatever
+    // `query.process` / future-queue span is currently active) and attach
+    // it to each QueryResult so the reaction forwarder can link to it.
+    let dispatch_span = tracing::info_span!(
+        "query.dispatch",
+        query_id = %query_id,
+        source_id = %source_id,
+    );
+    let _enter = dispatch_span.enter();
+    let dispatch_start = std::time::Instant::now();
     // Convert Drasi results to our QueryResult format
     let converted_results: Vec<ResultDiff> = results
         .iter()
@@ -235,7 +245,8 @@ async fn dispatch_query_results(
             meta
         },
         profiling,
-    );
+    )
+    .with_parent_span(Some(dispatch_span.clone()));
 
     debug!(
         "Query '{}' sending {} results to reactions",
@@ -251,6 +262,13 @@ async fn dispatch_query_results(
             debug!("Failed to dispatch result for query '{query_id}': {e}");
         }
     }
+
+    let elapsed_ns = dispatch_start.elapsed().as_nanos() as f64;
+    ::metrics::histogram!(
+        "drasi.query.dispatch_duration_ns",
+        "query_id" => query_id.to_string()
+    )
+    .record(elapsed_ns);
 }
 
 pub struct DrasiQuery {
@@ -642,15 +660,48 @@ impl Query for DrasiQuery {
                     loop {
                         match receiver.recv().await {
                             Ok(arc_event) => {
+                                // POC tracing: link the receive span to the
+                                // source.dispatch span carried on the wrapper
+                                // so the trace tree extends from source ->
+                                // query forwarder -> query processor.
+                                let source_span = arc_event.parent_span.clone();
+                                let receive_span = tracing::info_span!(
+                                    "query.receive",
+                                    query_id = %query_id,
+                                    source_id = %source_id_clone,
+                                );
+                                if let Some(ref ss) = source_span {
+                                    receive_span.follows_from(ss);
+                                }
+                                let _enter = receive_span.enter();
+
+                                ::metrics::counter!(
+                                    "drasi.query.events_received",
+                                    "query_id" => query_id.clone(),
+                                    "source_id" => source_id_clone.clone()
+                                )
+                                .increment(1);
+
                                 // Use appropriate enqueue method based on dispatch mode
                                 if use_blocking_enqueue {
                                     // Channel mode: Use blocking enqueue to prevent message loss
                                     // This creates backpressure when the priority queue is full
-                                    priority_queue.enqueue_wait(arc_event).await;
+                                    priority_queue
+                                        .enqueue_wait_with_span(
+                                            arc_event,
+                                            Some(receive_span.clone()),
+                                        )
+                                        .await;
                                 } else {
                                     // Broadcast mode: Use non-blocking enqueue to prevent deadlock
                                     // Messages may be dropped when priority queue is full
-                                    if !priority_queue.enqueue(arc_event).await {
+                                    if !priority_queue
+                                        .enqueue_with_span(
+                                            arc_event,
+                                            Some(receive_span.clone()),
+                                        )
+                                        .await
+                                    {
                                         warn!(
                                             "Query '{query_id}' priority queue at capacity, dropping event from source '{source_id_clone}' (broadcast mode)"
                                         );
@@ -1049,7 +1100,8 @@ impl Query for DrasiQuery {
                         }
 
                         // Dequeue events from priority queue (blocks until available)
-                        arc_event = priority_queue.dequeue() => {
+                        dequeued = priority_queue.dequeue_with_span() => {
+                            let (arc_event, parent_span) = dequeued;
                             // Try to extract without cloning if we have sole ownership (zero-copy path).
                             let (source_id, event, _timestamp, profiling_opt, _sequence) =
                                 match SourceEventWrapper::try_unwrap_arc(arc_event) {
@@ -1064,6 +1116,21 @@ impl Query for DrasiQuery {
                                         )
                                     }
                                 };
+
+                            // POC tracing: create the query.process span and link it
+                            // back to the query.receive span carried through the
+                            // priority queue using `follows_from`. This produces a
+                            // single connected trace tree across the channel hop.
+                            let process_span = tracing::info_span!(
+                                "query.process",
+                                query_id = %query_id,
+                                source_id = %source_id,
+                            );
+                            if let Some(ref ps) = parent_span {
+                                process_span.follows_from(ps);
+                            }
+                            let _process_enter = process_span.enter();
+                            let process_start = std::time::Instant::now();
 
                             debug!("Query '{query_id}' processing event from source '{source_id}'");
 
@@ -1101,12 +1168,26 @@ impl Query for DrasiQuery {
                                     profiling.query_receive_ns = Some(crate::profiling::timestamp_ns());
                                     profiling.query_core_call_ns = Some(crate::profiling::timestamp_ns());
 
-                                    match continuous_query_for_processor
+                                    let engine_start = std::time::Instant::now();
+                                    let engine_result = continuous_query_for_processor
                                         .process_source_change(source_change)
-                                        .await
+                                        .await;
+                                    let engine_elapsed_ns = engine_start.elapsed().as_nanos() as f64;
+                                    ::metrics::histogram!(
+                                        "drasi.query.engine_duration_ns",
+                                        "query_id" => query_id.clone()
+                                    )
+                                    .record(engine_elapsed_ns);
+
+                                    match engine_result
                                     {
                                         Ok(results) => {
                                             profiling.query_core_return_ns = Some(crate::profiling::timestamp_ns());
+                                            ::metrics::counter!(
+                                                "drasi.query.events_processed",
+                                                "query_id" => query_id.clone()
+                                            )
+                                            .increment(1);
                                             if !results.is_empty() {
                                                 profiling.query_send_ns = Some(crate::profiling::timestamp_ns());
                                                 dispatch_query_results(
@@ -1121,6 +1202,12 @@ impl Query for DrasiQuery {
                                             }
                                         }
                                         Err(e) => {
+                                            ::metrics::counter!(
+                                                "drasi.query.errors",
+                                                "query_id" => query_id.clone(),
+                                                "error_type" => "process_source_change"
+                                            )
+                                            .increment(1);
                                             error!("Query '{query_id}' failed to process source change: {e}");
                                         }
                                     }

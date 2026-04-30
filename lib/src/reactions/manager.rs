@@ -501,13 +501,51 @@ impl ReactionManager {
                     loop {
                         match receiver.recv().await {
                             Ok(query_result) => {
+                                // POC tracing: link to the query.dispatch span
+                                // carried on the result so the trace tree
+                                // extends source -> query -> reaction.
+                                let parent_span = query_result.parent_span.clone();
+                                let receive_span = tracing::info_span!(
+                                    "reaction.receive",
+                                    reaction_id = %reaction_id_owned,
+                                    query_id = %query_id_clone,
+                                );
+                                if let Some(ref ps) = parent_span {
+                                    receive_span.follows_from(ps);
+                                }
+                                let _enter = receive_span.enter();
+                                let enqueue_start = std::time::Instant::now();
+
                                 // Unwrap Arc or clone if shared
                                 let result = Arc::try_unwrap(query_result)
                                     .unwrap_or_else(|arc| (*arc).clone());
-                                if let Err(e) = reaction.enqueue_query_result(result).await {
+                                let enqueue_result =
+                                    reaction.enqueue_query_result(result).await;
+                                let elapsed_ns =
+                                    enqueue_start.elapsed().as_nanos() as f64;
+                                ::metrics::histogram!(
+                                    "drasi.reaction.enqueue_duration_ns",
+                                    "reaction_id" => reaction_id_owned.clone(),
+                                    "query_id" => query_id_clone.clone()
+                                )
+                                .record(elapsed_ns);
+                                if let Err(e) = enqueue_result {
+                                    ::metrics::counter!(
+                                        "drasi.reaction.errors",
+                                        "reaction_id" => reaction_id_owned.clone(),
+                                        "error_type" => "enqueue"
+                                    )
+                                    .increment(1);
                                     log::error!(
                                         "[{reaction_id_owned}] Failed to enqueue result from query '{query_id_clone}': {e}"
                                     );
+                                } else {
+                                    ::metrics::counter!(
+                                        "drasi.reaction.events_enqueued",
+                                        "reaction_id" => reaction_id_owned.clone(),
+                                        "query_id" => query_id_clone.clone()
+                                    )
+                                    .increment(1);
                                 }
                             }
                             Err(e) => {

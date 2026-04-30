@@ -1,0 +1,21 @@
+[package]
+name = "ffi-tracing-poc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "POC verifying plugin span propagation across an FFI boundary"
+
+[workspace]
+
+[dependencies]
+opentelemetry = "0.20"
+opentelemetry_sdk = "0.20"
+opentelemetry-stdout = { version = "0.1", features = ["trace"] }
+anyhow = "1.0"
+futures = "0.3"
+metrics = "0.24"
+metrics-util = "0.20"
+
+[[bin]]
+name = "ffi-tracing-poc"
+path = "main.rs"

@@ -617,7 +617,8 @@ impl SourceBase {
             profiling,
         );
 
-        // Dispatch event
+        // Dispatch event (instrumentation lives in dispatch_event so all
+        // dispatch paths — including dispatch_from_task — are covered).
         self.dispatch_event(wrapper).await
     }
 
@@ -626,8 +627,19 @@ impl SourceBase {
     /// This is a generic method for dispatching any SourceEvent.
     /// It handles Arc-wrapping for zero-copy sharing and logs
     /// when there are no subscribers.
-    pub async fn dispatch_event(&self, wrapper: SourceEventWrapper) -> Result<()> {
+    pub async fn dispatch_event(&self, mut wrapper: SourceEventWrapper) -> Result<()> {
         debug!("[{}] Dispatching event: {:?}", self.id, &wrapper);
+
+        // Tracing: open a `source.dispatch` span and attach it to the
+        // wrapper so the query forwarder can link to it via `follows_from`.
+        let dispatch_span = tracing::info_span!(
+            "source.dispatch",
+            source_id = %self.id,
+        );
+        let _enter = dispatch_span.enter();
+        wrapper.parent_span = Some(dispatch_span.clone());
+
+        let start = std::time::Instant::now();
 
         // Arc-wrap for zero-copy sharing across dispatchers
         let arc_wrapper = Arc::new(wrapper);
@@ -639,6 +651,18 @@ impl SourceBase {
                 debug!("[{}] Failed to dispatch event: {}", self.id, e);
             }
         }
+
+        let elapsed_ns = start.elapsed().as_nanos() as f64;
+        ::metrics::counter!(
+            "drasi.source.events_dispatched",
+            "source_id" => self.id.clone()
+        )
+        .increment(1);
+        ::metrics::histogram!(
+            "drasi.source.dispatch_duration_ns",
+            "source_id" => self.id.clone()
+        )
+        .record(elapsed_ns);
 
         Ok(())
     }
@@ -698,13 +722,23 @@ impl SourceBase {
     /// * `source_id` - Source ID for logging
     pub async fn dispatch_from_task(
         dispatchers: Arc<RwLock<Vec<Box<dyn ChangeDispatcher<SourceEventWrapper> + Send + Sync>>>>,
-        wrapper: SourceEventWrapper,
+        mut wrapper: SourceEventWrapper,
         source_id: &str,
     ) -> Result<()> {
         debug!(
             "[{}] Dispatching event from task: {:?}",
             source_id, &wrapper
         );
+
+        // Tracing: open a `source.dispatch` span and attach to the wrapper.
+        let dispatch_span = tracing::info_span!(
+            "source.dispatch",
+            source_id = %source_id,
+        );
+        let _enter = dispatch_span.enter();
+        wrapper.parent_span = Some(dispatch_span.clone());
+
+        let start = std::time::Instant::now();
 
         // Arc-wrap for zero-copy sharing across dispatchers
         let arc_wrapper = Arc::new(wrapper);
@@ -716,6 +750,18 @@ impl SourceBase {
                 debug!("[{source_id}] Failed to dispatch event from task: {e}");
             }
         }
+
+        let elapsed_ns = start.elapsed().as_nanos() as f64;
+        ::metrics::counter!(
+            "drasi.source.events_dispatched",
+            "source_id" => source_id.to_string()
+        )
+        .increment(1);
+        ::metrics::histogram!(
+            "drasi.source.dispatch_duration_ns",
+            "source_id" => source_id.to_string()
+        )
+        .record(elapsed_ns);
 
         Ok(())
     }

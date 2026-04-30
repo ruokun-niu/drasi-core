@@ -20,6 +20,7 @@ use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
+use tracing::Span;
 
 /// Wrapper for priority queue events with timestamp-based ordering
 #[derive(Clone)]
@@ -28,6 +29,11 @@ where
     T: Timestamped + Clone + Send + Sync + 'static,
 {
     event: Arc<T>,
+    /// Optional tracing span carried alongside the event so that downstream
+    /// processors can link their work back to the producer's span via
+    /// `follows_from`. This is `None` when no tracing subscriber is installed
+    /// or when the producer did not opt in to span propagation.
+    parent_span: Option<Span>,
 }
 
 impl<T> PriorityQueueEvent<T>
@@ -35,7 +41,17 @@ where
     T: Timestamped + Clone + Send + Sync + 'static,
 {
     fn new(event: Arc<T>) -> Self {
-        Self { event }
+        Self {
+            event,
+            parent_span: None,
+        }
+    }
+
+    fn with_span(event: Arc<T>, parent_span: Option<Span>) -> Self {
+        Self {
+            event,
+            parent_span,
+        }
     }
 }
 
@@ -183,6 +199,13 @@ where
     /// Enqueue an event into the priority queue
     /// Returns true if enqueued, false if queue is at capacity
     pub async fn enqueue(&self, event: Arc<T>) -> bool {
+        self.enqueue_with_span(event, None).await
+    }
+
+    /// Enqueue an event together with an optional parent span. The span is
+    /// returned alongside the event by `dequeue_with_span` / `try_dequeue_with_span`
+    /// so consumers can link their work back to the producer using `follows_from`.
+    pub async fn enqueue_with_span(&self, event: Arc<T>, parent_span: Option<Span>) -> bool {
         let mut heap = self.heap.lock().await;
 
         // Check capacity
@@ -210,7 +233,7 @@ where
         }
 
         // Enqueue event
-        heap.push(PriorityQueueEvent::new(event));
+        heap.push(PriorityQueueEvent::with_span(event, parent_span));
 
         // Update metrics using atomic operations (lock-free)
         self.metrics
@@ -251,6 +274,11 @@ where
     /// WARNING: Do NOT use with Broadcast dispatch mode - will cause deadlock!
     /// In broadcast mode, use the non-blocking `enqueue()` method instead.
     pub async fn enqueue_wait(&self, event: Arc<T>) {
+        self.enqueue_wait_with_span(event, None).await
+    }
+
+    /// Variant of `enqueue_wait` that also carries an optional parent span.
+    pub async fn enqueue_wait_with_span(&self, event: Arc<T>, parent_span: Option<Span>) {
         loop {
             // Register notified future BEFORE acquiring lock to avoid race
             let notified = self.notify.notified();
@@ -261,7 +289,7 @@ where
             // Check if there's capacity
             if heap.len() < self.max_capacity {
                 // Space available - enqueue the event
-                heap.push(PriorityQueueEvent::new(event));
+                heap.push(PriorityQueueEvent::with_span(event, parent_span));
 
                 // Update metrics using atomic operations (lock-free)
                 self.metrics
@@ -321,10 +349,16 @@ where
     /// Dequeue the oldest event from the priority queue (non-blocking)
     /// Returns None if queue is empty
     pub async fn try_dequeue(&self) -> Option<Arc<T>> {
-        let mut heap = self.heap.lock().await;
-        let event = heap.pop().map(|pq_event| pq_event.event);
+        self.try_dequeue_with_span().await.map(|(e, _)| e)
+    }
 
-        if event.is_some() {
+    /// Variant of `try_dequeue` that also returns any parent span associated
+    /// with the event when it was enqueued.
+    pub async fn try_dequeue_with_span(&self) -> Option<(Arc<T>, Option<Span>)> {
+        let mut heap = self.heap.lock().await;
+        let popped = heap.pop();
+
+        if let Some(pq_event) = popped {
             self.metrics
                 .total_dequeued
                 .fetch_add(1, AtomicOrdering::Relaxed);
@@ -335,13 +369,22 @@ where
 
             // Notify waiting enqueuers that space is available
             self.notify.notify_one();
-        }
 
-        event
+            Some((pq_event.event, pq_event.parent_span))
+        } else {
+            None
+        }
     }
 
     /// Dequeue the oldest event, waiting if the queue is empty
     pub async fn dequeue(&self) -> Arc<T> {
+        let (event, _) = self.dequeue_with_span().await;
+        event
+    }
+
+    /// Variant of `dequeue` that also returns any parent span associated
+    /// with the event when it was enqueued.
+    pub async fn dequeue_with_span(&self) -> (Arc<T>, Option<Span>) {
         loop {
             // Register the Notified future BEFORE checking the heap.
             // This avoids a race where an enqueue + notify_one() happens
@@ -351,7 +394,6 @@ where
 
             let mut heap = self.heap.lock().await;
             if let Some(pq_event) = heap.pop() {
-                let event = pq_event.event;
                 self.metrics
                     .total_dequeued
                     .fetch_add(1, AtomicOrdering::Relaxed);
@@ -363,7 +405,7 @@ where
                 // Notify waiting enqueuers that space is available
                 self.notify.notify_one();
 
-                return event;
+                return (pq_event.event, pq_event.parent_span);
             }
 
             // Enable the notified future while still holding the lock,

@@ -1,0 +1,25 @@
+[package]
+name = "tracing-poc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "POC verifying tracing spans + metrics added to drasi-lib"
+
+[workspace]
+
+[dependencies]
+drasi-lib = { path = "../../../lib" }
+drasi-source-mock = { path = "../../../components/sources/mock" }
+drasi-reaction-log = { path = "../../../components/reactions/log" }
+drasi-core = { path = "../../../core" }
+
+tokio = { version = "1.6", features = ["full"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+metrics = "0.24"
+metrics-util = "0.20"
+
+[[bin]]
+name = "tracing-poc"
+path = "main.rs"

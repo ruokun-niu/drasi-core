@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
+use tracing::Span;
 
 /// Trait for types that have a timestamp, required for priority queue ordering
 pub trait Timestamped {
@@ -227,6 +228,11 @@ pub struct SourceEventWrapper {
     /// `None` for volatile sources that don't support replay.
     /// When present, must be strictly increasing per source.
     pub sequence: Option<u64>,
+    /// Optional `tracing::Span` carried from the source dispatch site so
+    /// that the query forwarder can `follows_from` it. `None` when no
+    /// tracing subscriber is installed or when the source has not been
+    /// updated to propagate spans.
+    pub parent_span: Option<Span>,
 }
 
 impl SourceEventWrapper {
@@ -242,6 +248,7 @@ impl SourceEventWrapper {
             timestamp,
             profiling: None,
             sequence: None,
+            parent_span: None,
         }
     }
 
@@ -258,6 +265,7 @@ impl SourceEventWrapper {
             timestamp,
             profiling: Some(profiling),
             sequence: None,
+            parent_span: None,
         }
     }
 
@@ -275,7 +283,15 @@ impl SourceEventWrapper {
             timestamp,
             profiling,
             sequence: Some(sequence),
+            parent_span: None,
         }
+    }
+
+    /// Attach a `tracing::Span` to this wrapper so downstream stages can
+    /// link to it via `follows_from`.
+    pub fn with_parent_span(mut self, span: Option<Span>) -> Self {
+        self.parent_span = span;
+        self
     }
 
     /// Consume this wrapper and return its components.
@@ -407,6 +423,11 @@ pub struct QueryResult {
     /// Optional profiling metadata for performance tracking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profiling: Option<ProfilingMetadata>,
+    /// Optional `tracing::Span` carried from the dispatch site so the
+    /// reaction forwarder can `follows_from` it. Not serialized — span
+    /// handles only have meaning within the same process.
+    #[serde(skip)]
+    pub parent_span: Option<Span>,
 }
 
 impl QueryResult {
@@ -423,6 +444,7 @@ impl QueryResult {
             results,
             metadata,
             profiling: None,
+            parent_span: None,
         }
     }
 
@@ -440,7 +462,15 @@ impl QueryResult {
             results,
             metadata,
             profiling: Some(profiling),
+            parent_span: None,
         }
+    }
+
+    /// Attach a `tracing::Span` to this result so the reaction forwarder
+    /// can link to it via `follows_from`.
+    pub fn with_parent_span(mut self, span: Option<Span>) -> Self {
+        self.parent_span = span;
+        self
     }
 }
 

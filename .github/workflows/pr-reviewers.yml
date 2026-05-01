@@ -32,42 +32,42 @@ permissions:
 jobs:
   correctness:
     if: github.event.label.name == 'review:correctness' || github.event.label.name == 'review:all'
-    uses: drasi-project/.github/.github/workflows/pr-correctness-reviewer.lock.yml@main
+    uses: drasi-project/.github/.github/workflows/pr-correctness-reviewer.lock.yml@pr-review-agentic-workflows
     with:
       pr_url: ${{ github.event.pull_request.html_url }}
     secrets: inherit
 
   security:
     if: github.event.label.name == 'review:security' || github.event.label.name == 'review:all'
-    uses: drasi-project/.github/.github/workflows/pr-security-reviewer.lock.yml@main
+    uses: drasi-project/.github/.github/workflows/pr-security-reviewer.lock.yml@pr-review-agentic-workflows
     with:
       pr_url: ${{ github.event.pull_request.html_url }}
     secrets: inherit
 
   design:
     if: github.event.label.name == 'review:design' || github.event.label.name == 'review:all'
-    uses: drasi-project/.github/.github/workflows/pr-design-reviewer.lock.yml@main
+    uses: drasi-project/.github/.github/workflows/pr-design-reviewer.lock.yml@pr-review-agentic-workflows
     with:
       pr_url: ${{ github.event.pull_request.html_url }}
     secrets: inherit
 
   docs:
     if: github.event.label.name == 'review:docs' || github.event.label.name == 'review:all'
-    uses: drasi-project/.github/.github/workflows/pr-docs-reviewer.lock.yml@main
+    uses: drasi-project/.github/.github/workflows/pr-docs-reviewer.lock.yml@pr-review-agentic-workflows
     with:
       pr_url: ${{ github.event.pull_request.html_url }}
     secrets: inherit
 
   testing:
     if: github.event.label.name == 'review:testing' || github.event.label.name == 'review:all'
-    uses: drasi-project/.github/.github/workflows/pr-testing-reviewer.lock.yml@main
+    uses: drasi-project/.github/.github/workflows/pr-testing-reviewer.lock.yml@pr-review-agentic-workflows
     with:
       pr_url: ${{ github.event.pull_request.html_url }}
     secrets: inherit
 
   prior-art:
     if: github.event.label.name == 'review:prior-art' || github.event.label.name == 'review:all'
-    uses: drasi-project/.github/.github/workflows/pr-prior-art-reviewer.lock.yml@main
+    uses: drasi-project/.github/.github/workflows/pr-prior-art-reviewer.lock.yml@pr-review-agentic-workflows
     with:
       pr_url: ${{ github.event.pull_request.html_url }}
     secrets: inherit

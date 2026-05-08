@@ -243,6 +243,13 @@ pub fn load_plugin_from_path(
     // Step 4: Extract factory vtables into proxies
     // Take ownership of ALL arrays upfront before processing, so if any
     // proxy construction panics, remaining arrays are still dropped correctly.
+    //
+    // ABI contract: the plugin SDK's `register_plugin!` macro converts each
+    // descriptor `Vec` into a boxed slice (via `Vec::into_boxed_slice`) before
+    // exposing the raw pointer. This guarantees the underlying allocation has
+    // capacity == length, which makes `Vec::from_raw_parts(ptr, len, len)`
+    // sound here. Plugins built without that macro must uphold the same
+    // capacity-equals-length invariant.
     let source_vtables =
         if !registration.source_plugins.is_null() && registration.source_plugin_count > 0 {
             Some(unsafe {
@@ -382,20 +389,14 @@ fn read_plugin_metadata(lib: &Library) -> Option<String> {
 /// behavior, so the loader treats identity provider plugins as absent.
 const MIN_SDK_VERSION_WITH_IDENTITY_PROVIDERS: (u32, u32, u32) = (0, 6, 0);
 
-/// Parse a SemVer-ish version string into `(major, minor, patch)`. Trailing
-/// pre-release / build identifiers (e.g. `-rc.1`, `+abc`) on the patch are
-/// ignored. Returns `None` on malformed input.
+/// Parse a SemVer version string into `(major, minor, patch)`, ignoring any
+/// pre-release / build metadata. Returns `None` on malformed input.
+///
+/// Backed by the `semver` crate so behaviour matches the SemVer 2.0 spec
+/// (e.g. correct pre-release ordering, strict `MAJOR.MINOR.PATCH` form).
 fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = s.split('.');
-    let major: u32 = parts.next()?.parse().ok()?;
-    let minor: u32 = parts.next()?.parse().ok()?;
-    let patch_raw = parts.next().unwrap_or("0");
-    let patch_digits: String = patch_raw
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    let patch: u32 = patch_digits.parse().unwrap_or(0);
-    Some((major, minor, patch))
+    let v = semver::Version::parse(s).ok()?;
+    Some((v.major as u32, v.minor as u32, v.patch as u32))
 }
 
 /// Validate plugin metadata against the host SDK version.
@@ -931,5 +932,52 @@ mod tests {
     #[allow(clippy::const_is_empty)]
     fn test_default_patterns_not_empty() {
         assert!(!DEFAULT_PLUGIN_FILE_PATTERNS.is_empty());
+    }
+
+    // ── parse_semver tests ──
+
+    #[test]
+    fn test_parse_semver_canonical() {
+        assert_eq!(parse_semver("0.6.0"), Some((0, 6, 0)));
+        assert_eq!(parse_semver("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_semver("10.20.30"), Some((10, 20, 30)));
+    }
+
+    #[test]
+    fn test_parse_semver_strips_prerelease() {
+        assert_eq!(parse_semver("0.6.0-rc.1"), Some((0, 6, 0)));
+        assert_eq!(parse_semver("1.2.3-alpha"), Some((1, 2, 3)));
+    }
+
+    #[test]
+    fn test_parse_semver_strips_build_metadata() {
+        assert_eq!(parse_semver("0.6.0+abc"), Some((0, 6, 0)));
+        assert_eq!(parse_semver("1.2.3+build.42"), Some((1, 2, 3)));
+    }
+
+    #[test]
+    fn test_parse_semver_requires_full_form() {
+        // Strict SemVer 2.0 requires MAJOR.MINOR.PATCH.
+        assert_eq!(parse_semver("0.6"), None);
+        assert_eq!(parse_semver("1"), None);
+    }
+
+    #[test]
+    fn test_parse_semver_malformed_returns_none() {
+        assert_eq!(parse_semver(""), None);
+        assert_eq!(parse_semver("not-a-version"), None);
+        assert_eq!(parse_semver("0.x.0"), None);
+        assert_eq!(parse_semver("0"), None);
+    }
+
+    #[test]
+    fn test_parse_semver_against_min_identity_provider_version() {
+        // Below the threshold
+        assert!(parse_semver("0.5.9").unwrap() < MIN_SDK_VERSION_WITH_IDENTITY_PROVIDERS);
+        // Exactly meets the threshold
+        assert!(parse_semver("0.6.0").unwrap() >= MIN_SDK_VERSION_WITH_IDENTITY_PROVIDERS);
+        // Above the threshold
+        assert!(parse_semver("0.6.1").unwrap() > MIN_SDK_VERSION_WITH_IDENTITY_PROVIDERS);
+        assert!(parse_semver("1.0.0").unwrap() > MIN_SDK_VERSION_WITH_IDENTITY_PROVIDERS);
     }
 }

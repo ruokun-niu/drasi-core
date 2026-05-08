@@ -243,7 +243,10 @@ pub trait Source: Send + Sync {
     /// instance-wide provider injected through the runtime context during
     /// `initialize()`.
     ///
-    /// Implementation should delegate to `self.base.set_identity_provider(provider).await`.
+    /// Implementations backed by a [`SourceBase`](crate::sources::SourceBase)
+    /// should delegate to `self.base.set_identity_provider(provider).await`;
+    /// other implementors should store the provider and apply it during
+    /// `initialize()`.
     async fn set_identity_provider(
         &self,
         _provider: std::sync::Arc<dyn crate::identity::IdentityProvider>,

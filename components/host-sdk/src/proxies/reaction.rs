@@ -225,13 +225,12 @@ impl Reaction for ReactionProxy {
             *guard = Some(per_instance_ctx);
         }
 
-        let identity_vtable = self
-            .identity_provider
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .or_else(|| context.identity_provider.clone())
-            .map(|ip| crate::identity_bridge::IdentityProviderVtableBuilder::build(ip));
+        let identity_vtable = crate::proxies::identity_resolution::resolve_identity_provider(
+            &self.identity_provider,
+            context.identity_provider.clone(),
+            &format!("Reaction '{}'", self.cached_id),
+        )
+        .map(|ip| crate::identity_bridge::IdentityProviderVtableBuilder::build(ip));
 
         let ip_ptr = identity_vtable
             .map(|v| Box::into_raw(Box::new(v)) as *const _)
@@ -344,16 +343,25 @@ impl Reaction for ReactionProxy {
         unsafe { result.into_result().map_err(|e| anyhow::anyhow!(e)) }
     }
 
+    /// Stash a per-instance identity provider that will take precedence over
+    /// the runtime-context provider during [`Reaction::initialize`].
+    ///
+    /// # Timing constraint (FFI reactions only)
+    ///
+    /// For `ReactionProxy`, the provider must be set **before** the reaction
+    /// is added to `DrasiLib` (i.e. before the lifecycle manager calls
+    /// `initialize`). There is no FFI hook for late identity-provider
+    /// injection — the plugin only receives the provider through
+    /// `FfiRuntimeContext` during `initialize_fn`. Calls made after
+    /// `initialize` have no effect on the running plugin.
     async fn set_identity_provider(&self, provider: Arc<dyn IdentityProvider>) {
-        // Stash the provider so [`Reaction::initialize`] can prefer it over
-        // the instance-wide provider supplied via ReactionRuntimeContext.
-        // There is no FFI hook for late identity-provider injection — the
-        // plugin only sees the provider through `FfiRuntimeContext` during
-        // `initialize_fn`. This means [`set_identity_provider`] must be called
-        // before the reaction is added to DrasiLib (i.e. before the manager
-        // invokes `initialize`).
-        if let Ok(mut guard) = self.identity_provider.lock() {
-            *guard = Some(provider);
+        // See doc comment above for the timing constraint.
+        match self.identity_provider.lock() {
+            Ok(mut guard) => *guard = Some(provider),
+            Err(_) => log::warn!(
+                "Reaction '{}': identity_provider mutex is poisoned; provider not set",
+                self.cached_id
+            ),
         }
     }
 }

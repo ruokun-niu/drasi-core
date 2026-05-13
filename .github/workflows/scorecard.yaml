@@ -1,7 +1,6 @@
 name: Scorecard supply-chain security
 on:
   workflow_dispatch:
-  branch_protection_rule:
   schedule:
     - cron: '15 15 * * 1'
   push:

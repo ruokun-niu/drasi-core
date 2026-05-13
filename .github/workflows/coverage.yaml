@@ -110,7 +110,7 @@ jobs:
             --exclude drasi-identity-azure --exclude drasi-identity-aws \
             --exclude drasi-index-rocksdb --exclude drasi-index-garnet \
             --exclude drasi-state-store-redb \
-            --exclude drasi-ffi-primitives --exclude drasi-plugin-sdk --exclude drasi-host-sdk \
+            --exclude drasi-ffi-primitives --exclude drasi-plugin-sdk \
             --exclude drasi-mssql-common \
             --exclude xtask --exclude query-perf --exclude query-example \
             --lcov --output-path core-lcov.info
@@ -208,7 +208,10 @@ jobs:
   coverage-finalize:
     name: Finalize Coverage
     needs: [core-coverage, plugin-coverage]
-    if: always()
+    # Run whenever at least one upstream coverage job actually executed (success
+    # or failure). Skip when both are skipped (e.g. draft PRs) so we don't try
+    # to finalize a Coveralls build that was never started.
+    if: ${{ !cancelled() && (needs.core-coverage.result != 'skipped' || needs.plugin-coverage.result != 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - name: Finalize Coveralls

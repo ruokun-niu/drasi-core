@@ -15,16 +15,16 @@
 name: Generate Rust Code Coverage
 
 on:
+  # Coveralls "Minimum CI Configuration":
+  # - Build push to default branch to establish the baseline.
+  # - Build pull_request builds targeting the default branch for diff reports.
+  # See: https://docs.coveralls.io/recommended-ci-configurations
   push:
     branches:
       - main
-      - improve-drasi-core
-
   pull_request:
     branches:
       - main
-      - feature/*
-      - feature-lib
 
 env:
   CARGO_TERM_COLOR: always

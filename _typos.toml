@@ -21,3 +21,5 @@ socal = "socal"
 Hashi = "Hashi"
 WHER = "WHER"
 UPDAT = "UPDAT"
+# Intentional substring used in assert!(...contains("entit")) tests
+entit = "entit"

@@ -10,7 +10,7 @@ permissions: read-all
 
 jobs:
   scorecard:
-    uses: drasi-project/.github/.github/workflows/scorecard.yaml@main
+    uses: drasi-project/.github/.github/workflows/scorecard.yaml@scorecard-fix
     permissions:
       security-events: write
       id-token: write

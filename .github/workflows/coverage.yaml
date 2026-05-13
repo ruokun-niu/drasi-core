@@ -185,8 +185,11 @@ jobs:
           cargo llvm-cov \
             -p drasi-source-postgres \
             -p drasi-source-http \
+            -p drasi-source-grpc \
+            -p drasi-source-mssql \
             -p drasi-source-application \
             -p drasi-reaction-http \
+            -p drasi-reaction-grpc \
             -p drasi-reaction-log \
             -p drasi-reaction-sse \
             -p drasi-bootstrap-postgres \

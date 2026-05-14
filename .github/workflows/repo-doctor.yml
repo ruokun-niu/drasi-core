@@ -10,7 +10,7 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: ruokunniu/repo-doctor@v0.1.0
+      - uses: ruokun-niu/repo-doctor@v0.1.0
         with:
           preset: standard
           fail-on: never

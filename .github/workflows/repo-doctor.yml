@@ -1,0 +1,17 @@
+name: repo-doctor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  metadata: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ruokunniu/repo-doctor@v0.1.0
+        with:
+          preset: standard
+          fail-on: never

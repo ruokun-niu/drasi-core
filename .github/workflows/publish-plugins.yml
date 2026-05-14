@@ -1,9 +1,6 @@
 name: Publish Plugins
 
 on:
-  push:
-    branches:
-      - repo-doctor-test
   workflow_dispatch:
     inputs:
       pre_release:

@@ -596,79 +596,14 @@ impl HttpSource {
         let mut error_count = 0;
         let mut last_error = None;
 
+        // Convert all events first so the entire batch can be persisted to the
+        // WAL in a single grouped transaction (one fsync) rather than one fsync
+        // per event.
+        let mut converted: Vec<drasi_core::models::SourceChange> =
+            Vec::with_capacity(events.len());
         for (idx, event) in events.iter().enumerate() {
             match convert_http_to_source_change(event, source_id) {
-                Ok(source_change) => {
-                    // WAL append before ACK (if durability enabled)
-                    let sequence = if let Some(ref wal) = state.wal {
-                        match wal.append(&state.source_id, &source_change).await {
-                            Ok(seq) => {
-                                trace!(
-                                    "[{}] WAL append succeeded: sequence={}",
-                                    state.source_id,
-                                    seq
-                                );
-                                Some(seq)
-                            }
-                            Err(WalError::CapacityExhausted(_)) => {
-                                warn!(
-                                    "[{}] WAL capacity exhausted, rejecting event",
-                                    state.source_id
-                                );
-                                return Err((
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    Json(EventResponse {
-                                        success: false,
-                                        message: "WAL capacity exhausted".to_string(),
-                                        error: Some("Source durability buffer is full".to_string()),
-                                    }),
-                                ));
-                            }
-                            Err(e) => {
-                                error!(
-                                    "[{}] WAL append failed for event {}: {}",
-                                    state.source_id,
-                                    idx + 1,
-                                    e
-                                );
-                                // WAL durability failure is a server-side error — reject entire batch
-                                return Err((
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    Json(EventResponse {
-                                        success: false,
-                                        message: format!(
-                                            "WAL durability failure at event {}: {e}",
-                                            idx + 1
-                                        ),
-                                        error: Some(format!("WAL error: {e}")),
-                                    }),
-                                ));
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    let change_event = SourceChangeEvent {
-                        source_id: source_id.to_string(),
-                        change: source_change,
-                        timestamp: chrono::Utc::now(),
-                        sequence,
-                    };
-
-                    if let Err(e) = state.batch_tx.send(change_event).await {
-                        error!(
-                            "[{}] Failed to send event {} to batch channel: {}",
-                            state.source_id,
-                            idx + 1,
-                            e
-                        );
-                        error_count += 1;
-                        last_error = Some("Internal channel error".to_string());
-                    } else {
-                        success_count += 1;
-                    }
-                }
+                Ok(source_change) => converted.push(source_change),
                 Err(e) => {
                     error!(
                         "[{}] Failed to convert event {}: {}",
@@ -679,6 +614,76 @@ impl HttpSource {
                     error_count += 1;
                     last_error = Some(e.to_string());
                 }
+            }
+        }
+
+        // WAL append before ACK (if durability enabled): persist the whole
+        // converted batch atomically. On failure the entire batch is rejected,
+        // and nothing is dispatched downstream, preserving at-least-once
+        // semantics.
+        let sequences: Vec<Option<u64>> = if let Some(ref wal) = state.wal {
+            if converted.is_empty() {
+                Vec::new()
+            } else {
+                match wal.append_batch(&state.source_id, &converted).await {
+                    Ok(seqs) => {
+                        trace!(
+                            "[{}] WAL append_batch succeeded: {} events",
+                            state.source_id,
+                            seqs.len()
+                        );
+                        seqs.into_iter().map(Some).collect()
+                    }
+                    Err(WalError::CapacityExhausted(_)) => {
+                        warn!(
+                            "[{}] WAL capacity exhausted, rejecting batch",
+                            state.source_id
+                        );
+                        return Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(EventResponse {
+                                success: false,
+                                message: "WAL capacity exhausted".to_string(),
+                                error: Some("Source durability buffer is full".to_string()),
+                            }),
+                        ));
+                    }
+                    Err(e) => {
+                        error!("[{}] WAL append_batch failed: {}", state.source_id, e);
+                        // WAL durability failure is a server-side error — reject entire batch
+                        return Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(EventResponse {
+                                success: false,
+                                message: format!("WAL durability failure: {e}"),
+                                error: Some(format!("WAL error: {e}")),
+                            }),
+                        ));
+                    }
+                }
+            }
+        } else {
+            vec![None; converted.len()]
+        };
+
+        // Dispatch each persisted event downstream, in order.
+        for (source_change, sequence) in converted.into_iter().zip(sequences) {
+            let change_event = SourceChangeEvent {
+                source_id: source_id.to_string(),
+                change: source_change,
+                timestamp: chrono::Utc::now(),
+                sequence,
+            };
+
+            if let Err(e) = state.batch_tx.send(change_event).await {
+                error!(
+                    "[{}] Failed to send event to batch channel: {}",
+                    state.source_id, e
+                );
+                error_count += 1;
+                last_error = Some("Internal channel error".to_string());
+            } else {
+                success_count += 1;
             }
         }
 

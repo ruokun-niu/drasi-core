@@ -274,6 +274,147 @@ impl WalProvider for RedbWalProvider {
         .map_err(|e| WalError::StorageError(format!("spawn_blocking join error: {e}")))?
     }
 
+    async fn append_batch(
+        &self,
+        source_id: &str,
+        events: &[SourceChange],
+    ) -> Result<Vec<u64>, WalError> {
+        // Reject the whole batch at the trait boundary if any event is a
+        // Future variant — the batch is all-or-nothing, so a single invalid
+        // event must not partially persist.
+        for event in events {
+            if matches!(event, SourceChange::Future { .. }) {
+                return Err(WalError::InvalidEvent(
+                    "SourceChange::Future events cannot be persisted to WAL".into(),
+                ));
+            }
+        }
+
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let state = self.get_state(source_id).await?;
+
+        // Serialize every event up front, before entering the blocking closure.
+        let mut serialized: Vec<Vec<u8>> = Vec::with_capacity(events.len());
+        for event in events {
+            let dto: SourceChangeDto = event.into();
+            let record = WalRecord {
+                version: WAL_FORMAT_VERSION,
+                change: dto,
+            };
+            let bytes = bincode::serialize(&record).map_err(|e| {
+                WalError::SerializationError(format!("bincode serialize failed: {e}"))
+            })?;
+            serialized.push(bytes);
+        }
+
+        let source_id_owned = source_id.to_string();
+        let batch_len = serialized.len() as u64;
+
+        tokio::task::spawn_blocking(move || {
+            let write_txn = state
+                .db
+                .begin_write()
+                .map_err(|e| WalError::StorageError(format!("begin_write failed: {e}")))?;
+
+            // All inserts share one write transaction, so the entire batch is
+            // persisted with a single commit (one fsync) instead of one per
+            // event. Sequence numbers are only allocated on the insert path, so
+            // a rejected batch leaves no gaps in the in-memory counter.
+            let mut sequences = Vec::with_capacity(serialized.len());
+            {
+                let mut events_table = write_txn.open_table(EVENTS_TABLE).map_err(|e| {
+                    WalError::StorageError(format!("open events table failed: {e}"))
+                })?;
+
+                match state.config.capacity_policy {
+                    CapacityPolicy::RejectIncoming => {
+                        // RejectIncoming rejects the batch atomically: either
+                        // the whole batch fits or nothing is written.
+                        let current_count = events_table.len().map_err(|e| {
+                            WalError::StorageError(format!("read event count failed: {e}"))
+                        })?;
+                        if current_count + batch_len > state.config.max_events {
+                            return Err(WalError::CapacityExhausted(source_id_owned));
+                        }
+
+                        for bytes in &serialized {
+                            let sequence = state.counter.fetch_add(1, Ordering::SeqCst) + 1;
+                            events_table.insert(sequence, bytes.as_slice()).map_err(|e| {
+                                WalError::StorageError(format!("insert event failed: {e}"))
+                            })?;
+                            sequences.push(sequence);
+                        }
+                    }
+                    CapacityPolicy::OverwriteOldest => {
+                        // Evict the oldest entries as needed before each insert
+                        // so the WAL never exceeds max_events, retaining the
+                        // newest events even when the batch alone is larger than
+                        // capacity.
+                        for bytes in &serialized {
+                            loop {
+                                let current = events_table.len().map_err(|e| {
+                                    WalError::StorageError(format!("read event count failed: {e}"))
+                                })?;
+                                if current < state.config.max_events {
+                                    break;
+                                }
+                                let oldest_key = events_table
+                                    .first()
+                                    .map_err(|e| {
+                                        WalError::StorageError(format!(
+                                            "read oldest entry failed: {e}"
+                                        ))
+                                    })?
+                                    .map(|entry| entry.0.value());
+                                match oldest_key {
+                                    Some(key) => {
+                                        events_table.remove(key).map_err(|e| {
+                                            WalError::StorageError(format!(
+                                                "evict oldest failed: {e}"
+                                            ))
+                                        })?;
+                                    }
+                                    None => break,
+                                }
+                            }
+
+                            let sequence = state.counter.fetch_add(1, Ordering::SeqCst) + 1;
+                            events_table.insert(sequence, bytes.as_slice()).map_err(|e| {
+                                WalError::StorageError(format!("insert event failed: {e}"))
+                            })?;
+                            sequences.push(sequence);
+                        }
+                    }
+                }
+            }
+
+            // Persist the highest allocated sequence in the same transaction so
+            // recovery is atomic with the event inserts.
+            {
+                let mut metadata = write_txn.open_table(METADATA_TABLE).map_err(|e| {
+                    WalError::StorageError(format!("open metadata table failed: {e}"))
+                })?;
+                let last_sequence = *sequences
+                    .last()
+                    .expect("batch is non-empty after the early return above");
+                metadata
+                    .insert(COUNTER_KEY, last_sequence.to_le_bytes().as_slice())
+                    .map_err(|e| WalError::StorageError(format!("update counter failed: {e}")))?;
+            }
+
+            write_txn
+                .commit()
+                .map_err(|e| WalError::StorageError(format!("commit failed: {e}")))?;
+
+            Ok(sequences)
+        })
+        .await
+        .map_err(|e| WalError::StorageError(format!("spawn_blocking join error: {e}")))?
+    }
+
     async fn read_from(
         &self,
         source_id: &str,

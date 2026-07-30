@@ -65,6 +65,36 @@ pub trait WalProvider: Send + Sync {
     /// [`CapacityPolicy`](super::CapacityPolicy).
     async fn append(&self, source_id: &str, event: &SourceChange) -> Result<u64, WalError>;
 
+    /// Append a batch of events to the source's WAL as a single durable unit,
+    /// returning the assigned monotonic sequence numbers in the same order as
+    /// `events`.
+    ///
+    /// Implementations that can group the writes (e.g. one storage transaction
+    /// with a single fsync) should do so to amortize per-event durability cost.
+    /// The batch is all-or-nothing: on error, no events are persisted and no
+    /// sequence numbers are consumed.
+    ///
+    /// Rejects the batch if any event is a
+    /// [`SourceChange::Future`](drasi_core::models::SourceChange::Future).
+    /// On capacity exhaustion, behavior depends on the registered
+    /// [`CapacityPolicy`](super::CapacityPolicy); an empty batch is a no-op that
+    /// returns an empty vector.
+    ///
+    /// The default implementation appends events one at a time via
+    /// [`append`](WalProvider::append) and therefore provides no grouping
+    /// benefit; implementations should override it where batching is possible.
+    async fn append_batch(
+        &self,
+        source_id: &str,
+        events: &[SourceChange],
+    ) -> Result<Vec<u64>, WalError> {
+        let mut sequences = Vec::with_capacity(events.len());
+        for event in events {
+            sequences.push(self.append(source_id, event).await?);
+        }
+        Ok(sequences)
+    }
+
     /// Read events from `sequence` (inclusive) to the head, in sequence order.
     ///
     /// Returns [`WalError::PositionUnavailable`] if `sequence` is older than

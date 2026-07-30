@@ -1077,3 +1077,149 @@ async fn test_corrupt_counter_errors_on_open() {
         "expected StorageError about corrupt counter, got {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// append_batch
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_append_batch_assigns_contiguous_sequences_and_reads_back() {
+    let tmp = TempDir::new().unwrap();
+    let provider = new_provider(tmp.path());
+    register_default(&provider, TEST_SRC).await;
+
+    let batch = vec![
+        make_test_insert("n1"),
+        make_test_insert("n2"),
+        make_test_update("n1"),
+    ];
+    let seqs = provider.append_batch(TEST_SRC, &batch).await.unwrap();
+
+    // Sequences are contiguous and in input order.
+    assert_eq!(seqs.len(), 3);
+    assert_eq!(seqs[1], seqs[0] + 1);
+    assert_eq!(seqs[2], seqs[1] + 1);
+
+    // All events are readable, in order, with their assigned sequences.
+    let events = provider.read_from(TEST_SRC, seqs[0]).await.unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0], (seqs[0], make_test_insert("n1")));
+    assert_eq!(events[1], (seqs[1], make_test_insert("n2")));
+    assert_eq!(events[2], (seqs[2], make_test_update("n1")));
+}
+
+#[tokio::test]
+async fn test_append_batch_continues_sequence_after_append() {
+    let tmp = TempDir::new().unwrap();
+    let provider = new_provider(tmp.path());
+    register_default(&provider, TEST_SRC).await;
+
+    let first = provider
+        .append(TEST_SRC, &make_test_insert("n0"))
+        .await
+        .unwrap();
+
+    let seqs = provider
+        .append_batch(TEST_SRC, &[make_test_insert("n1"), make_test_insert("n2")])
+        .await
+        .unwrap();
+
+    assert_eq!(seqs[0], first + 1);
+    assert_eq!(seqs[1], first + 2);
+    assert_eq!(provider.event_count(TEST_SRC).await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn test_append_batch_empty_is_noop() {
+    let tmp = TempDir::new().unwrap();
+    let provider = new_provider(tmp.path());
+    register_default(&provider, TEST_SRC).await;
+
+    let seqs = provider.append_batch(TEST_SRC, &[]).await.unwrap();
+    assert!(seqs.is_empty());
+    assert_eq!(provider.event_count(TEST_SRC).await.unwrap(), 0);
+    // Head sequence is untouched (no sequence numbers consumed).
+    assert_eq!(provider.head_sequence(TEST_SRC).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_append_batch_rejects_future_events_atomically() {
+    let tmp = TempDir::new().unwrap();
+    let provider = new_provider(tmp.path());
+    register_default(&provider, TEST_SRC).await;
+
+    let batch = vec![
+        make_test_insert("n1"),
+        make_test_future("n2"),
+        make_test_insert("n3"),
+    ];
+    let err = provider.append_batch(TEST_SRC, &batch).await.unwrap_err();
+    assert!(matches!(err, WalError::InvalidEvent(_)));
+
+    // Nothing was persisted and no sequence numbers were consumed.
+    assert_eq!(provider.event_count(TEST_SRC).await.unwrap(), 0);
+    assert_eq!(provider.head_sequence(TEST_SRC).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_append_batch_reject_incoming_rejects_whole_batch() {
+    let tmp = TempDir::new().unwrap();
+    let provider = new_provider(tmp.path());
+    provider
+        .register(TEST_SRC, small_config(16, CapacityPolicy::RejectIncoming))
+        .await
+        .unwrap();
+
+    // Fill to 15/16, leaving room for exactly one more.
+    for i in 0..15 {
+        provider
+            .append(TEST_SRC, &make_test_insert(&format!("n{i}")))
+            .await
+            .unwrap();
+    }
+
+    // A batch of 2 would exceed capacity (15 + 2 > 16): reject atomically.
+    let batch = vec![make_test_insert("a"), make_test_insert("b")];
+    let err = provider.append_batch(TEST_SRC, &batch).await.unwrap_err();
+    assert!(matches!(err, WalError::CapacityExhausted(_)));
+
+    // The WAL is unchanged — no partial writes.
+    assert_eq!(provider.event_count(TEST_SRC).await.unwrap(), 15);
+}
+
+#[tokio::test]
+async fn test_append_batch_overwrite_oldest_evicts_to_fit() {
+    let tmp = TempDir::new().unwrap();
+    let provider = new_provider(tmp.path());
+    provider
+        .register(TEST_SRC, small_config(16, CapacityPolicy::OverwriteOldest))
+        .await
+        .unwrap();
+
+    // Fill to capacity.
+    for i in 0..16 {
+        provider
+            .append(TEST_SRC, &make_test_insert(&format!("n{i}")))
+            .await
+            .unwrap();
+    }
+
+    // Append a batch of 4; the 4 oldest must be evicted to stay at capacity.
+    let batch = vec![
+        make_test_insert("a"),
+        make_test_insert("b"),
+        make_test_insert("c"),
+        make_test_insert("d"),
+    ];
+    let seqs = provider.append_batch(TEST_SRC, &batch).await.unwrap();
+
+    // Still exactly max_events retained.
+    assert_eq!(provider.event_count(TEST_SRC).await.unwrap(), 16);
+
+    // The newest batch is retained and readable at its sequences.
+    let events = provider.read_from(TEST_SRC, seqs[0]).await.unwrap();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0].1, make_test_insert("a"));
+    assert_eq!(events[3].1, make_test_insert("d"));
+}
+

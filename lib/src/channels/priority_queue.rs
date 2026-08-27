@@ -21,31 +21,51 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 
-/// Wrapper for priority queue events with timestamp-based ordering
+/// Wrapper for priority queue events with timestamp-based ordering.
+///
+/// Ordering is by event timestamp (oldest first), with a monotonic
+/// `insertion_seq` tie-breaker that makes equal-timestamp events pop in
+/// insertion (FIFO) order. Without the tie-breaker the underlying
+/// [`BinaryHeap`] pops equal-timestamp events in an arbitrary,
+/// heap-structure-dependent order. That reordering is silent data loss for
+/// downstream consumers that rely on per-source sequence order: the query
+/// processor's sequence-based dedup treats each source's sequence as a
+/// high-water mark and drops any event whose sequence is `<=` the last one
+/// processed, so an out-of-order (lower sequence, same timestamp) event would
+/// be discarded. Events are enqueued in per-source sequence order, so a FIFO
+/// tie-break preserves that order and prevents the drop.
 #[derive(Clone)]
 struct PriorityQueueEvent<T>
 where
     T: Timestamped + Clone + Send + Sync + 'static,
 {
     event: Arc<T>,
+    /// Monotonic insertion counter used to break timestamp ties in FIFO order.
+    insertion_seq: u64,
 }
 
 impl<T> PriorityQueueEvent<T>
 where
     T: Timestamped + Clone + Send + Sync + 'static,
 {
-    fn new(event: Arc<T>) -> Self {
-        Self { event }
+    fn new(event: Arc<T>, insertion_seq: u64) -> Self {
+        Self {
+            event,
+            insertion_seq,
+        }
     }
 }
 
-// Implement ordering for priority queue (oldest events first - min-heap)
+// Implement ordering for priority queue (oldest events first - min-heap).
+// Equal timestamps are broken by insertion order so the heap is a stable FIFO
+// for same-timestamp events.
 impl<T> PartialEq for PriorityQueueEvent<T>
 where
     T: Timestamped + Clone + Send + Sync + 'static,
 {
     fn eq(&self, other: &Self) -> bool {
         self.event.timestamp() == other.event.timestamp()
+            && self.insertion_seq == other.insertion_seq
     }
 }
 
@@ -65,8 +85,15 @@ where
     T: Timestamped + Clone + Send + Sync + 'static,
 {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse ordering for min-heap behavior (oldest first)
-        other.event.timestamp().cmp(&self.event.timestamp())
+        // `BinaryHeap` is a max-heap and pops the greatest element first.
+        // Reverse the timestamp comparison so the oldest event is "greatest"
+        // (min-heap behavior), then break ties so the lowest insertion_seq
+        // (enqueued first) is "greatest" and therefore popped first.
+        other
+            .event
+            .timestamp()
+            .cmp(&self.event.timestamp())
+            .then_with(|| other.insertion_seq.cmp(&self.insertion_seq))
     }
 }
 
@@ -164,6 +191,10 @@ where
     max_capacity: usize,
     /// Metrics (using atomic operations for lock-free updates)
     metrics: Arc<PriorityQueueMetrics>,
+    /// Monotonic counter assigning each enqueued event an insertion sequence,
+    /// used as a FIFO tie-breaker so equal-timestamp events dequeue in the
+    /// order they were enqueued (preserving per-source sequence order).
+    insertion_counter: Arc<AtomicU64>,
 }
 
 impl<T> PriorityQueue<T>
@@ -177,6 +208,7 @@ where
             notify: Arc::new(Notify::new()),
             max_capacity,
             metrics: Arc::new(PriorityQueueMetrics::default()),
+            insertion_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -209,8 +241,11 @@ where
             return false;
         }
 
-        // Enqueue event
-        heap.push(PriorityQueueEvent::new(event));
+        // Enqueue event. The insertion sequence is assigned under the heap
+        // lock so the counter order matches heap insertion order, giving
+        // equal-timestamp events a stable FIFO dequeue order.
+        let insertion_seq = self.insertion_counter.fetch_add(1, AtomicOrdering::Relaxed);
+        heap.push(PriorityQueueEvent::new(event, insertion_seq));
 
         // Update metrics using atomic operations (lock-free)
         self.metrics
@@ -260,8 +295,12 @@ where
 
             // Check if there's capacity
             if heap.len() < self.max_capacity {
-                // Space available - enqueue the event
-                heap.push(PriorityQueueEvent::new(event));
+                // Space available - enqueue the event. Assign the insertion
+                // sequence under the lock so equal-timestamp events keep a
+                // stable FIFO dequeue order.
+                let insertion_seq =
+                    self.insertion_counter.fetch_add(1, AtomicOrdering::Relaxed);
+                heap.push(PriorityQueueEvent::new(event, insertion_seq));
 
                 // Update metrics using atomic operations (lock-free)
                 self.metrics
@@ -434,6 +473,7 @@ where
             notify: Arc::clone(&self.notify),
             max_capacity: self.max_capacity,
             metrics: Arc::clone(&self.metrics),
+            insertion_counter: Arc::clone(&self.insertion_counter),
         }
     }
 }
@@ -486,6 +526,58 @@ mod tests {
 
         let dequeued3 = pq.try_dequeue().await.unwrap();
         assert_eq!(dequeued3.id, "event3"); // Newest
+    }
+
+    #[tokio::test]
+    async fn test_equal_timestamp_events_dequeue_in_fifo_order() {
+        // Regression test for silent event loss under backpressure: equal-
+        // timestamp events must dequeue in insertion (FIFO) order. The
+        // downstream sequence-dedup uses a per-source high-water mark, so any
+        // reordering of same-timestamp events would cause the lower-sequence
+        // event to be dropped.
+        let pq = PriorityQueue::new(1000);
+
+        let ts = Utc::now();
+        let count = 500;
+        for i in 0..count {
+            pq.enqueue(create_test_event(&format!("event{i}"), ts)).await;
+        }
+
+        for i in 0..count {
+            let dequeued = pq.try_dequeue().await.unwrap();
+            assert_eq!(
+                dequeued.id,
+                format!("event{i}"),
+                "equal-timestamp events must dequeue in FIFO order"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fifo_tiebreak_preserved_across_dequeue_and_enqueue() {
+        // Interleave enqueue/dequeue to ensure the FIFO tie-break holds even
+        // as the heap is drained and refilled with equal-timestamp events.
+        let pq = PriorityQueue::new(1000);
+        let ts = Utc::now();
+
+        for i in 0..10 {
+            pq.enqueue(create_test_event(&format!("a{i}"), ts)).await;
+        }
+        // Drain half.
+        for i in 0..5 {
+            assert_eq!(pq.try_dequeue().await.unwrap().id, format!("a{i}"));
+        }
+        // Add more with the same timestamp.
+        for i in 0..5 {
+            pq.enqueue(create_test_event(&format!("b{i}"), ts)).await;
+        }
+        // Remaining originals should still come out before the new ones.
+        for i in 5..10 {
+            assert_eq!(pq.try_dequeue().await.unwrap().id, format!("a{i}"));
+        }
+        for i in 0..5 {
+            assert_eq!(pq.try_dequeue().await.unwrap().id, format!("b{i}"));
+        }
     }
 
     #[tokio::test]

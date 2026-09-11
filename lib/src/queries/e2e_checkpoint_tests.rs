@@ -456,6 +456,111 @@ async fn test_e2e_resume_sequence_carried_back() {
     core.stop_query("e2e-rs-q").await.unwrap();
 }
 
+#[tokio::test]
+#[serial]
+async fn test_e2e_output_corruption_auto_reset_clears_resume_sequence() {
+    struct SharedIndexes(Arc<crate::indexes::CreatedIndexes>);
+
+    #[async_trait]
+    impl IndexBackendPlugin for SharedIndexes {
+        async fn create_indexes(
+            &self,
+            _query_id: &str,
+        ) -> Result<crate::indexes::CreatedIndexes, drasi_core::interface::IndexError> {
+            Ok(crate::indexes::CreatedIndexes {
+                set: crate::indexes::IndexSet {
+                    element_index: self.0.set.element_index.clone(),
+                    archive_index: self.0.set.archive_index.clone(),
+                    result_index: self.0.set.result_index.clone(),
+                    future_queue: self.0.set.future_queue.clone(),
+                    session_control: self.0.set.session_control.clone(),
+                },
+                checkpoint_store: self.0.checkpoint_store.clone(),
+                outbox_writer: self.0.outbox_writer.clone(),
+                live_results_writer: self.0.live_results_writer.clone(),
+            })
+        }
+
+        fn is_volatile(&self) -> bool {
+            false
+        }
+    }
+
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let source_id = "output-reset-src";
+    let query_id = "output-reset-q";
+    let query_config =
+        make_persistent_query(query_id, source_id, Some(RecoveryPolicy::AutoReset));
+    let provider = RocksDbIndexProvider::new(tmp_dir.path(), false, false);
+    let indexes = Arc::new(provider.create_indexes(query_id).await.unwrap());
+    let shared_provider = Arc::new(SharedIndexes(indexes.clone()));
+
+    {
+        let core = DrasiLib::builder()
+            .with_id("output-reset-seed")
+            .with_index_provider("persistent", shared_provider.clone())
+            .build()
+            .await
+            .unwrap();
+        let source = E2eTestSource::new(source_id, true).unwrap();
+        let event_tx = source.event_sender();
+        core.add_source(source).await.unwrap();
+        core.start_source(source_id).await.unwrap();
+        wait_for_status(&core, source_id, ComponentStatus::Running).await;
+        core.add_query(query_config.clone()).await.unwrap();
+        core.start_query(query_id).await.unwrap();
+        wait_for_status(&core, query_id, ComponentStatus::Running).await;
+        send_event(&event_tx, source_id, 7, b"pos-7").await;
+        core.shutdown().await.unwrap();
+    }
+
+    {
+        let checkpoints = indexes
+            .checkpoint_store
+            .as_ref()
+            .unwrap()
+            .read_all_checkpoints()
+            .await
+            .unwrap();
+        assert_eq!(checkpoints.get(source_id).unwrap().sequence, 7);
+        indexes
+            .outbox_writer
+            .as_ref()
+            .unwrap()
+            .append(query_id, 99, b"corrupt-outbox-payload")
+            .await
+            .unwrap();
+    }
+
+    let core = DrasiLib::builder()
+        .with_id("output-reset-recover")
+        .with_index_provider("persistent", shared_provider)
+        .build()
+        .await
+        .unwrap();
+    let source = E2eTestSource::new(source_id, true).unwrap();
+    let resume_sequence = source.last_resume_sequence();
+    let resume_from = source.last_resume_from();
+    let sub_count = source.subscribe_count_handle();
+    core.add_source(source).await.unwrap();
+    core.start_source(source_id).await.unwrap();
+    wait_for_status(&core, source_id, ComponentStatus::Running).await;
+    core.add_query(query_config).await.unwrap();
+    core.start_query(query_id).await.unwrap();
+    wait_for_status(&core, query_id, ComponentStatus::Running).await;
+
+    assert_eq!(sub_count.load(Ordering::Acquire), 1);
+    assert!(
+        resume_from.read().await.is_none(),
+        "Output corruption AutoReset must clear resume_from"
+    );
+    assert!(
+        resume_sequence.read().await.is_none(),
+        "Output corruption AutoReset must clear resume_sequence"
+    );
+    core.shutdown().await.unwrap();
+}
+
 /// Auto-reset must clear `resume_sequence` (not just `resume_from`): after a
 /// checkpoint exists, a forced auto-reset re-subscribe should hand the source a
 /// fresh-start `resume_sequence = None`, matching the cleared `resume_from`.

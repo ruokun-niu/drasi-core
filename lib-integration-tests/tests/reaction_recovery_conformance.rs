@@ -894,8 +894,8 @@ async fn recover_phase(paths: &FixturePaths) -> Result<()> {
     let final_journal = wait_for_journal_sequences(&paths.journal, 4).await?;
     let final_journal = journal_emissions(&final_journal)?;
 
+    let final_checkpoint = wait_for_checkpoint_sequence(fixture.state_store.as_ref(), 4).await?;
     fixture.state_store.sync().await?;
-    let final_checkpoint = read_reaction_checkpoint(fixture.state_store.as_ref()).await?;
 
     let observed = RecoveryObservation {
         checkpoint_before_start: checkpoint_before_start.sequence,
@@ -1106,35 +1106,42 @@ async fn recover_autoreset_phase(paths: &FixturePaths) -> Result<()> {
     wait_for_status(&fixture.core, SOURCE_ID, ComponentStatus::Running).await?;
     wait_for_status(&fixture.core, QUERY_ID, ComponentStatus::Running).await?;
 
-    let wiped = observe_snapshot(&fixture.core).await?;
+    let rebuilt = wait_for_snapshot_row(&fixture.core, &person("p3", "Carol", true)).await?;
     assert_eq!(
-        wiped.sequence, 0,
-        "AutoReset must wipe output so the snapshot sequence is 0"
-    );
-    assert!(
-        wiped.people.is_empty(),
-        "AutoReset must wipe live rows and graph indexes; leftover seed rows would mean output-only wipe left ResultIndex populated. got {:?}",
-        wiped.people
+        rebuilt,
+        SnapshotObservation {
+            sequence: 3,
+            people: vec![
+                person("p1", "Alice", true),
+                person("p2", "Bob", false),
+                person("p3", "Carol", true),
+            ],
+        },
+        "AutoReset must rebuild the snapshot from retained WAL events"
     );
 
     let query = query_instance(&fixture.core).await?;
     let outbox = query.fetch_outbox(0).await?;
-    assert!(
-        outbox.results.is_empty(),
-        "AutoReset must wipe the outbox; got sequences {:?}",
-        outbox
-            .results
-            .iter()
-            .map(|result| result.sequence)
-            .collect::<Vec<_>>()
+    assert_eq!(
+        outbox.output_generation, 1,
+        "AutoReset must start a new output generation"
     );
-    assert_eq!(outbox.latest_sequence, 0);
+    assert_eq!(
+        outbox_emissions(&outbox.results)?,
+        vec![
+            add_emission(1, "p1", "Alice", true),
+            add_emission(2, "p2", "Bob", false),
+            add_emission(3, "p3", "Carol", true),
+        ],
+        "AutoReset must replace corrupt output with exactly the replayed WAL emissions"
+    );
+    assert_eq!(outbox.latest_sequence, 3);
 
     insert_person(&fixture.source, "p5", "Eve", true).await?;
     let after = wait_for_snapshot_row(&fixture.core, &person("p5", "Eve", true)).await?;
     assert_eq!(
-        after.sequence, 1,
-        "the first result after AutoReset wipe must be sequence 1, not a reused durable key"
+        after.sequence, 4,
+        "the first live result after AutoReset must follow the replayed WAL emissions"
     );
 
     let final_outbox = query.fetch_outbox(0).await?;
@@ -1144,7 +1151,7 @@ async fn recover_autoreset_phase(paths: &FixturePaths) -> Result<()> {
             .iter()
             .map(|result| result.sequence)
             .collect::<Vec<_>>(),
-        vec![1]
+        vec![1, 2, 3, 4]
     );
 
     fixture.core.shutdown().await?;

@@ -177,6 +177,80 @@ mod tests {
         zoned_time::ZonedTime as VarZonedTime, VariableValue,
     };
 
+    #[tokio::test]
+    async fn durable_output_update_round_trip_and_sequence_continuation() {
+        use super::*;
+        use drasi_core::in_memory_index::{
+            in_memory_checkpoint_store::InMemoryCheckpointStore,
+            in_memory_live_results_writer::InMemoryLiveResultsWriter,
+            in_memory_outbox_writer::InMemoryOutboxWriter,
+        };
+        use serde_json::json;
+
+        let stores = DurableOutputStores {
+            checkpoint_store: Arc::new(InMemoryCheckpointStore::new()),
+            outbox_writer: Some(Arc::new(InMemoryOutboxWriter::new())),
+            live_results_writer: Some(Arc::new(InMemoryLiveResultsWriter::new())),
+        };
+        let before_state = RwLock::new(QueryOutputState::new(10));
+        let signature = 13_660_005_145_781_501_189;
+        let diff = ResultDiff::Update {
+            data: json!({"value": 2}),
+            before: json!({"value": 1}),
+            after: json!({"value": 2}),
+            grouping_keys: None,
+            row_signature: signature,
+        };
+        let written = stage_durable_query_output(
+            std::slice::from_ref(&diff),
+            "source",
+            "query",
+            &before_state,
+            &stores.outbox_writer,
+            &stores.live_results_writer,
+            &Some(stores.checkpoint_store.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (rows, outbox, sequence, generation) = load_durable_output("query", &stores, 10)
+            .await
+            .expect("persisted Update must be readable during recovery");
+        assert_eq!(sequence, 1);
+        assert_eq!(rows.get(&signature), Some(&json!({"value": 2})));
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(
+            serde_json::to_value(outbox[0].as_ref()).unwrap(),
+            serde_json::to_value(&written).unwrap()
+        );
+
+        let mut recovered = QueryOutputState::new(10);
+        recovered.hydrate(rows, outbox, sequence, generation);
+        let recovered_state = RwLock::new(recovered);
+        let next = stage_durable_query_output(
+            &[diff],
+            "source",
+            "query",
+            &recovered_state,
+            &stores.outbox_writer,
+            &stores.live_results_writer,
+            &Some(stores.checkpoint_store.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(next.sequence, 2);
+        let (_, outbox, sequence, _) = load_durable_output("query", &stores, 10).await.unwrap();
+        assert_eq!(sequence, 2);
+        assert_eq!(
+            outbox
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
     #[test]
     fn temporal_values_serialize_as_plain_strings() {
         let date = NaiveDate::from_ymd_opt(2024, 6, 15).expect("valid date");
@@ -498,7 +572,7 @@ async fn stage_durable_query_output(
     );
 
     if let Some(writer) = outbox_writer {
-        let data = rmp_serde::to_vec(&query_result).map_err(|e| {
+        let data = rmp_serde::to_vec_named(&query_result).map_err(|e| {
             output_persist_error(format!(
                 "Query '{query_id}' failed to serialize result seq={next_seq} for outbox: {e}"
             ))

@@ -19,6 +19,10 @@
 //! - Component logs are properly captured and streamed
 //! - The streaming APIs work correctly for sources, queries, and reactions
 
+#[path = "../../lib/tests/support/logging.rs"]
+mod logging;
+use logging::with_component_logs;
+
 use async_trait::async_trait;
 use drasi_lib::{
     channels::QueryResult, ComponentEvent, ComponentStatus, ComponentType, DrasiLib, LogLevel,
@@ -314,59 +318,62 @@ async fn wait_for_running(drasi: &DrasiLib, component_id: &str) {
 /// Test that source logs are captured and can be streamed.
 #[tokio::test]
 async fn test_source_log_streaming() {
-    let source = TestSource::new("test-source-logs").expect("Failed to create source");
+    with_component_logs(async {
+        let source = TestSource::new("test-source-logs").expect("Failed to create source");
 
-    let drasi = DrasiLib::builder()
-        .with_source(source)
-        .build()
-        .await
-        .expect("Failed to build DrasiLib");
+        let drasi = DrasiLib::builder()
+            .with_source(source)
+            .build()
+            .await
+            .expect("Failed to build DrasiLib");
 
-    // Subscribe to logs BEFORE starting
-    let (initial_logs, mut log_receiver) = drasi
-        .subscribe_source_logs("test-source-logs")
-        .await
-        .expect("Failed to subscribe to source logs");
+        // Subscribe to logs BEFORE starting
+        let (initial_logs, mut log_receiver) = drasi
+            .subscribe_source_logs("test-source-logs")
+            .await
+            .expect("Failed to subscribe to source logs");
 
-    // Initial logs should be empty before start
-    assert!(
-        initial_logs.is_empty(),
-        "Expected no logs before start, got: {initial_logs:?}"
-    );
+        // Initial logs should be empty before start
+        assert!(
+            initial_logs.is_empty(),
+            "Expected no logs before start, got: {initial_logs:?}"
+        );
 
-    // Start the server
-    drasi.start().await.expect("Failed to start DrasiLib");
+        // Start the server
+        drasi.start().await.expect("Failed to start DrasiLib");
 
-    // Collect streamed logs
-    let mut received_logs = Vec::new();
-    let _ = timeout(Duration::from_secs(2), async {
-        while let Ok(log) = log_receiver.recv().await {
-            received_logs.push(log);
-            if received_logs.len() >= 3 {
-                break;
+        // Collect streamed logs
+        let mut received_logs = Vec::new();
+        let _ = timeout(Duration::from_secs(2), async {
+            while let Ok(log) = log_receiver.recv().await {
+                received_logs.push(log);
+                if received_logs.len() >= 3 {
+                    break;
+                }
             }
-        }
+        })
+        .await;
+
+        // Verify we received logs
+        assert!(
+            !received_logs.is_empty(),
+            "Expected to receive logs via streaming"
+        );
+
+        // Check for expected log messages
+        let log_messages: Vec<_> = received_logs.iter().map(|l| l.message.as_str()).collect();
+        println!("Received source logs: {log_messages:?}");
+
+        assert!(
+            log_messages
+                .iter()
+                .any(|m| m.contains("starting") || m.contains("started")),
+            "Expected lifecycle logs, got: {log_messages:?}"
+        );
+
+        drasi.shutdown().await.unwrap();
     })
     .await;
-
-    // Verify we received logs
-    assert!(
-        !received_logs.is_empty(),
-        "Expected to receive logs via streaming"
-    );
-
-    // Check for expected log messages
-    let log_messages: Vec<_> = received_logs.iter().map(|l| l.message.as_str()).collect();
-    println!("Received source logs: {log_messages:?}");
-
-    assert!(
-        log_messages
-            .iter()
-            .any(|m| m.contains("starting") || m.contains("started")),
-        "Expected lifecycle logs, got: {log_messages:?}"
-    );
-
-    drasi.stop().await.ok();
 }
 
 /// Test that source events are captured and can be streamed.
@@ -507,37 +514,40 @@ async fn test_query_event_streaming() {
 /// Test that query logs are captured and can be streamed.
 #[tokio::test]
 async fn test_query_log_streaming() {
-    let source = TestSource::new("query-log-source").expect("Failed to create source");
+    with_component_logs(async {
+        let source = TestSource::new("query-log-source").expect("Failed to create source");
 
-    let query = Query::cypher("test-query-logs")
-        .from_input("query-log-source")
-        .query("MATCH (n) RETURN n")
-        .build();
+        let query = Query::cypher("test-query-logs")
+            .from_input("query-log-source")
+            .query("MATCH (n) RETURN n")
+            .build();
 
-    let drasi = DrasiLib::builder()
-        .with_source(source)
-        .with_query(query)
-        .build()
-        .await
-        .expect("Failed to build DrasiLib");
+        let drasi = DrasiLib::builder()
+            .with_source(source)
+            .with_query(query)
+            .build()
+            .await
+            .expect("Failed to build DrasiLib");
 
-    drasi.start().await.expect("Failed to start DrasiLib");
+        drasi.start().await.expect("Failed to start DrasiLib");
 
-    // Wait for query to reach Running (startup logs emitted before this)
-    wait_for_running(&drasi, "test-query-logs").await;
+        // Wait for query to reach Running (startup logs emitted before this)
+        wait_for_running(&drasi, "test-query-logs").await;
 
-    // Get log history
-    let (history, _receiver) = drasi
-        .subscribe_query_logs("test-query-logs")
-        .await
-        .expect("Failed to subscribe to query logs");
+        // Get log history
+        let (history, _receiver) = drasi
+            .subscribe_query_logs("test-query-logs")
+            .await
+            .expect("Failed to subscribe to query logs");
 
-    println!("Query logs: {history:?}");
+        println!("Query logs: {history:?}");
 
-    // Queries emit lifecycle logs
-    // (Note: depending on implementation, there may or may not be logs)
+        // Queries emit lifecycle logs
+        // (Note: depending on implementation, there may or may not be logs)
 
-    drasi.stop().await.ok();
+        drasi.shutdown().await.unwrap();
+    })
+    .await;
 }
 
 /// Test that reaction events are captured and can be streamed.
@@ -619,185 +629,193 @@ async fn test_reaction_event_streaming() {
 /// Test that reaction logs are captured and can be streamed.
 #[tokio::test]
 async fn test_reaction_log_streaming() {
-    let source = TestSource::new("reaction-log-source").expect("Failed to create source");
+    with_component_logs(async {
+        let source = TestSource::new("reaction-log-source").expect("Failed to create source");
 
-    let query = Query::cypher("reaction-log-query")
-        .from_input("reaction-log-source")
-        .query("MATCH (n) RETURN n")
-        .build();
+        let query = Query::cypher("reaction-log-query")
+            .from_input("reaction-log-source")
+            .query("MATCH (n) RETURN n")
+            .build();
 
-    let reaction = TestReaction::new("test-reaction-logs", vec!["reaction-log-query".to_string()]);
+        let reaction =
+            TestReaction::new("test-reaction-logs", vec!["reaction-log-query".to_string()]);
 
-    let drasi = DrasiLib::builder()
-        .with_source(source)
-        .with_query(query)
-        .with_reaction(reaction)
-        .build()
-        .await
-        .expect("Failed to build DrasiLib");
+        let drasi = DrasiLib::builder()
+            .with_source(source)
+            .with_query(query)
+            .with_reaction(reaction)
+            .build()
+            .await
+            .expect("Failed to build DrasiLib");
 
-    // Subscribe to logs BEFORE starting
-    let (_initial_logs, mut log_receiver) = drasi
-        .subscribe_reaction_logs("test-reaction-logs")
-        .await
-        .expect("Failed to subscribe to reaction logs");
+        // Subscribe to logs BEFORE starting
+        let (_initial_logs, mut log_receiver) = drasi
+            .subscribe_reaction_logs("test-reaction-logs")
+            .await
+            .expect("Failed to subscribe to reaction logs");
 
-    // Start the server
-    drasi.start().await.expect("Failed to start DrasiLib");
+        // Start the server
+        drasi.start().await.expect("Failed to start DrasiLib");
 
-    // Collect streamed logs
-    let mut received_logs = Vec::new();
-    let _ = timeout(Duration::from_secs(2), async {
-        while let Ok(log) = log_receiver.recv().await {
-            received_logs.push(log);
-            if received_logs.len() >= 2 {
-                break;
+        // Collect streamed logs
+        let mut received_logs = Vec::new();
+        let _ = timeout(Duration::from_secs(2), async {
+            while let Ok(log) = log_receiver.recv().await {
+                received_logs.push(log);
+                if received_logs.len() >= 2 {
+                    break;
+                }
             }
-        }
+        })
+        .await;
+
+        // Verify we received logs
+        assert!(
+            !received_logs.is_empty(),
+            "Expected to receive reaction logs via streaming"
+        );
+
+        let log_messages: Vec<_> = received_logs.iter().map(|l| l.message.as_str()).collect();
+        println!("Received reaction logs: {log_messages:?}");
+
+        assert!(
+            log_messages
+                .iter()
+                .any(|m| m.contains("starting") || m.contains("started")),
+            "Expected lifecycle logs, got: {log_messages:?}"
+        );
+
+        drasi.shutdown().await.unwrap();
     })
     .await;
-
-    // Verify we received logs
-    assert!(
-        !received_logs.is_empty(),
-        "Expected to receive reaction logs via streaming"
-    );
-
-    let log_messages: Vec<_> = received_logs.iter().map(|l| l.message.as_str()).collect();
-    println!("Received reaction logs: {log_messages:?}");
-
-    assert!(
-        log_messages
-            .iter()
-            .any(|m| m.contains("starting") || m.contains("started")),
-        "Expected lifecycle logs, got: {log_messages:?}"
-    );
-
-    drasi.stop().await.ok();
 }
 
 /// Test full lifecycle with log and event streaming for all component types.
 #[tokio::test]
 async fn test_full_lifecycle_streaming() {
-    let source = TestSource::new("full-lifecycle-source").expect("Failed to create source");
+    with_component_logs(async {
+        let source = TestSource::new("full-lifecycle-source").expect("Failed to create source");
 
-    let query = Query::cypher("full-lifecycle-query")
-        .from_input("full-lifecycle-source")
-        .query("MATCH (n) RETURN n")
-        .build();
+        let query = Query::cypher("full-lifecycle-query")
+            .from_input("full-lifecycle-source")
+            .query("MATCH (n) RETURN n")
+            .build();
 
-    let reaction = TestReaction::new(
-        "full-lifecycle-reaction",
-        vec!["full-lifecycle-query".to_string()],
-    );
+        let reaction = TestReaction::new(
+            "full-lifecycle-reaction",
+            vec!["full-lifecycle-query".to_string()],
+        );
 
-    let drasi = DrasiLib::builder()
-        .with_source(source)
-        .with_query(query)
-        .with_reaction(reaction)
-        .build()
-        .await
-        .expect("Failed to build DrasiLib");
+        let drasi = DrasiLib::builder()
+            .with_source(source)
+            .with_query(query)
+            .with_reaction(reaction)
+            .build()
+            .await
+            .expect("Failed to build DrasiLib");
 
-    // Subscribe to all event streams
-    let (_source_events, mut source_event_rx) = drasi
-        .subscribe_source_events("full-lifecycle-source")
-        .await
-        .expect("Failed to subscribe to source events");
+        // Subscribe to all event streams
+        let (_source_events, mut source_event_rx) = drasi
+            .subscribe_source_events("full-lifecycle-source")
+            .await
+            .expect("Failed to subscribe to source events");
 
-    let (_query_events, mut query_event_rx) = drasi
-        .subscribe_query_events("full-lifecycle-query")
-        .await
-        .expect("Failed to subscribe to query events");
+        let (_query_events, mut query_event_rx) = drasi
+            .subscribe_query_events("full-lifecycle-query")
+            .await
+            .expect("Failed to subscribe to query events");
 
-    let (_reaction_events, mut reaction_event_rx) = drasi
-        .subscribe_reaction_events("full-lifecycle-reaction")
-        .await
-        .expect("Failed to subscribe to reaction events");
+        let (_reaction_events, mut reaction_event_rx) = drasi
+            .subscribe_reaction_events("full-lifecycle-reaction")
+            .await
+            .expect("Failed to subscribe to reaction events");
 
-    // Start the server
-    drasi.start().await.expect("Failed to start DrasiLib");
+        // Start the server
+        drasi.start().await.expect("Failed to start DrasiLib");
 
-    // Collect events from all streams
-    let mut source_events = Vec::new();
-    let mut query_events = Vec::new();
-    let mut reaction_events = Vec::new();
+        // Collect events from all streams
+        let mut source_events = Vec::new();
+        let mut query_events = Vec::new();
+        let mut reaction_events = Vec::new();
 
-    let _ = timeout(Duration::from_secs(3), async {
-        loop {
-            tokio::select! {
-                Ok(event) = source_event_rx.recv() => {
-                    source_events.push(event);
+        let _ = timeout(Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    Ok(event) = source_event_rx.recv() => {
+                        source_events.push(event);
+                    }
+                    Ok(event) = query_event_rx.recv() => {
+                        query_events.push(event);
+                    }
+                    Ok(event) = reaction_event_rx.recv() => {
+                        reaction_events.push(event);
+                    }
+                    else => break,
                 }
-                Ok(event) = query_event_rx.recv() => {
-                    query_events.push(event);
+
+                // Check if all components reached Running
+                let source_running = source_events
+                    .iter()
+                    .any(|e| e.status == ComponentStatus::Running);
+                let query_running = query_events
+                    .iter()
+                    .any(|e| e.status == ComponentStatus::Running);
+                let reaction_running = reaction_events
+                    .iter()
+                    .any(|e| e.status == ComponentStatus::Running);
+
+                if source_running && query_running && reaction_running {
+                    break;
                 }
-                Ok(event) = reaction_event_rx.recv() => {
-                    reaction_events.push(event);
-                }
-                else => break,
             }
+        })
+        .await;
 
-            // Check if all components reached Running
-            let source_running = source_events
+        println!(
+            "Source events: {:?}",
+            source_events.iter().map(|e| &e.status).collect::<Vec<_>>()
+        );
+        println!(
+            "Query events: {:?}",
+            query_events.iter().map(|e| &e.status).collect::<Vec<_>>()
+        );
+        println!(
+            "Reaction events: {:?}",
+            reaction_events
                 .iter()
-                .any(|e| e.status == ComponentStatus::Running);
-            let query_running = query_events
-                .iter()
-                .any(|e| e.status == ComponentStatus::Running);
-            let reaction_running = reaction_events
-                .iter()
-                .any(|e| e.status == ComponentStatus::Running);
+                .map(|e| &e.status)
+                .collect::<Vec<_>>()
+        );
 
-            if source_running && query_running && reaction_running {
-                break;
-            }
-        }
+        // Verify all components reached Running state
+        assert!(
+            source_events
+                .iter()
+                .any(|e| e.status == ComponentStatus::Running),
+            "Source should have reached Running state"
+        );
+        assert!(
+            query_events
+                .iter()
+                .any(|e| e.status == ComponentStatus::Running),
+            "Query should have reached Running state"
+        );
+        assert!(
+            reaction_events
+                .iter()
+                .any(|e| e.status == ComponentStatus::Running),
+            "Reaction should have reached Running state"
+        );
+
+        // Now stop and verify stop events
+        drasi.stop().await.ok();
+
+        // The stop event propagates through the main event channel, not directly to event_history.
+        // The fact that we can successfully stop all components is the key verification here.
+        // The Running events we captured above verify the live streaming works correctly.
+        drasi.shutdown().await.unwrap();
     })
     .await;
-
-    println!(
-        "Source events: {:?}",
-        source_events.iter().map(|e| &e.status).collect::<Vec<_>>()
-    );
-    println!(
-        "Query events: {:?}",
-        query_events.iter().map(|e| &e.status).collect::<Vec<_>>()
-    );
-    println!(
-        "Reaction events: {:?}",
-        reaction_events
-            .iter()
-            .map(|e| &e.status)
-            .collect::<Vec<_>>()
-    );
-
-    // Verify all components reached Running state
-    assert!(
-        source_events
-            .iter()
-            .any(|e| e.status == ComponentStatus::Running),
-        "Source should have reached Running state"
-    );
-    assert!(
-        query_events
-            .iter()
-            .any(|e| e.status == ComponentStatus::Running),
-        "Query should have reached Running state"
-    );
-    assert!(
-        reaction_events
-            .iter()
-            .any(|e| e.status == ComponentStatus::Running),
-        "Reaction should have reached Running state"
-    );
-
-    // Now stop and verify stop events
-    drasi.stop().await.ok();
-
-    // The stop event propagates through the main event channel, not directly to event_history.
-    // The fact that we can successfully stop all components is the key verification here.
-    // The Running events we captured above verify the live streaming works correctly.
 }
 
 /// Test that subscribing to non-existent components fails gracefully.
@@ -834,64 +852,67 @@ async fn test_subscribe_nonexistent_component() {
 /// Test that log levels are correctly captured.
 #[tokio::test]
 async fn test_log_levels_captured() {
-    let source = TestSource::new("log-levels-source").expect("Failed to create source");
+    with_component_logs(async {
+        let source = TestSource::new("log-levels-source").expect("Failed to create source");
 
-    let drasi = DrasiLib::builder()
-        .with_source(source)
-        .build()
-        .await
-        .expect("Failed to build DrasiLib");
+        let drasi = DrasiLib::builder()
+            .with_source(source)
+            .build()
+            .await
+            .expect("Failed to build DrasiLib");
 
-    // Subscribe to logs before starting to detect log arrival
-    let (_, mut log_rx) = drasi
-        .subscribe_source_logs("log-levels-source")
-        .await
-        .expect("Failed to subscribe to source logs");
+        // Subscribe to logs before starting to detect log arrival
+        let (_, mut log_rx) = drasi
+            .subscribe_source_logs("log-levels-source")
+            .await
+            .expect("Failed to subscribe to source logs");
 
-    drasi.start().await.expect("Failed to start DrasiLib");
+        drasi.start().await.expect("Failed to start DrasiLib");
 
-    // Wait for multiple logs to arrive. The first log may arrive quickly but
-    // lifecycle logs (Starting, Running) trickle in asynchronously. Wait for
-    // up to 5 seconds, collecting logs until we have enough or time out.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut received_count = 0;
-    while tokio::time::Instant::now() < deadline {
-        match timeout(Duration::from_millis(500), log_rx.recv()).await {
-            Ok(Ok(_)) => {
-                received_count += 1;
-                if received_count >= 2 {
-                    break;
+        // Wait for multiple logs to arrive. The first log may arrive quickly but
+        // lifecycle logs (Starting, Running) trickle in asynchronously. Wait for
+        // up to 5 seconds, collecting logs until we have enough or time out.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut received_count = 0;
+        while tokio::time::Instant::now() < deadline {
+            match timeout(Duration::from_millis(500), log_rx.recv()).await {
+                Ok(Ok(_)) => {
+                    received_count += 1;
+                    if received_count >= 2 {
+                        break;
+                    }
                 }
+                Ok(Err(_)) => break, // channel closed
+                Err(_) => continue,  // timeout, try again
             }
-            Ok(Err(_)) => break, // channel closed
-            Err(_) => continue,  // timeout, try again
         }
-    }
 
-    // Get log history
-    let (history, _) = drasi
-        .subscribe_source_logs("log-levels-source")
-        .await
-        .expect("Failed to subscribe to source logs");
+        // Get log history
+        let (history, _) = drasi
+            .subscribe_source_logs("log-levels-source")
+            .await
+            .expect("Failed to subscribe to source logs");
 
-    // Check that we have INFO level logs (default level)
-    // DEBUG logs are filtered by default; use RUST_LOG=debug to capture them
-    let has_info = history.iter().any(|l| l.level == LogLevel::Info);
+        // Check that we have INFO level logs (default level)
+        // DEBUG logs are filtered by default; use RUST_LOG=debug to capture them
+        let has_info = history.iter().any(|l| l.level == LogLevel::Info);
 
-    println!(
-        "Log levels captured: {:?}",
-        history
-            .iter()
-            .map(|l| format!("[{:?}] {}", l.level, l.message))
-            .collect::<Vec<_>>()
-    );
+        println!(
+            "Log levels captured: {:?}",
+            history
+                .iter()
+                .map(|l| format!("[{:?}] {}", l.level, l.message))
+                .collect::<Vec<_>>()
+        );
 
-    assert!(has_info, "Expected Info level logs");
-    // Verify we have multiple INFO logs from the lifecycle
-    assert!(
-        history.iter().filter(|l| l.level == LogLevel::Info).count() >= 2,
-        "Expected at least 2 INFO level logs"
-    );
+        assert!(has_info, "Expected Info level logs");
+        // Verify we have multiple INFO logs from the lifecycle
+        assert!(
+            history.iter().filter(|l| l.level == LogLevel::Info).count() >= 2,
+            "Expected at least 2 INFO level logs"
+        );
 
-    drasi.stop().await.ok();
+        drasi.shutdown().await.unwrap();
+    })
+    .await;
 }

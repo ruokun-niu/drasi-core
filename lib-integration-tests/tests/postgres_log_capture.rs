@@ -18,6 +18,10 @@
 //! from spawned tasks) are properly routed to the component log streaming
 //! infrastructure and accessible via the DrasiLib public API.
 
+#[path = "../../lib/tests/support/logging.rs"]
+mod logging;
+use logging::with_component_logs;
+
 use drasi_lib::{ComponentStatus, DrasiLib, LogLevel};
 use drasi_source_postgres::PostgresReplicationSource;
 use serial_test::serial;
@@ -31,143 +35,146 @@ use tokio::time::timeout;
 #[tokio::test]
 #[serial]
 async fn test_postgres_source_logs_captured_on_success() {
-    // Start a PostgreSQL container with logical replication and scram-sha-256 auth
-    let container = Postgres::default()
-        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "scram-sha-256")
-        .with_env_var("POSTGRES_INITDB_ARGS", "--auth-host=scram-sha-256")
-        .with_cmd([
-            "postgres",
-            "-c",
-            "wal_level=logical",
-            "-c",
-            "max_replication_slots=10",
-            "-c",
-            "max_wal_senders=10",
-            "-c",
-            "password_encryption=scram-sha-256",
-        ])
-        .start()
-        .await
-        .expect("Failed to start PostgreSQL container");
+    with_component_logs(async {
+        // Start a PostgreSQL container with logical replication and scram-sha-256 auth
+        let container = Postgres::default()
+            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "scram-sha-256")
+            .with_env_var("POSTGRES_INITDB_ARGS", "--auth-host=scram-sha-256")
+            .with_cmd([
+                "postgres",
+                "-c",
+                "wal_level=logical",
+                "-c",
+                "max_replication_slots=10",
+                "-c",
+                "max_wal_senders=10",
+                "-c",
+                "password_encryption=scram-sha-256",
+            ])
+            .start()
+            .await
+            .expect("Failed to start PostgreSQL container");
 
-    let host = container.get_host().await.expect("Failed to get host");
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("Failed to get port");
+        let host = container.get_host().await.expect("Failed to get host");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("Failed to get port");
 
-    // Set up the database with a publication
-    let conn_str =
-        format!("host={host} port={port} user=postgres password=postgres dbname=postgres");
-    let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
-        .await
-        .expect("Failed to connect to PostgreSQL");
+        // Set up the database with a publication
+        let conn_str =
+            format!("host={host} port={port} user=postgres password=postgres dbname=postgres");
+        let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+            .await
+            .expect("Failed to connect to PostgreSQL");
 
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("Connection error: {e}");
-        }
-    });
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("Connection error: {e}");
+            }
+        });
 
-    // Create a test table and publication
-    client
-        .execute(
-            "CREATE TABLE test_items (id SERIAL PRIMARY KEY, name TEXT)",
-            &[],
+        // Create a test table and publication
+        client
+            .execute(
+                "CREATE TABLE test_items (id SERIAL PRIMARY KEY, name TEXT)",
+                &[],
+            )
+            .await
+            .expect("Failed to create table");
+
+        client
+            .execute("CREATE PUBLICATION drasi_pub FOR TABLE test_items", &[])
+            .await
+            .expect("Failed to create publication");
+
+        // Create the PostgreSQL source
+        let source = PostgresReplicationSource::builder("test-pg-source")
+            .with_host(host.to_string())
+            .with_port(port)
+            .with_database("postgres")
+            .with_user("postgres")
+            .with_password("postgres")
+            .with_tables(vec!["test_items".to_string()])
+            .with_publication_name("drasi_pub")
+            .with_slot_name("test_slot")
+            .build()
+            .expect("Failed to build PostgreSQL source");
+
+        // Create DrasiLib and add the source
+        let drasi = DrasiLib::builder()
+            .with_source(source)
+            .build()
+            .await
+            .expect("Failed to build DrasiLib");
+
+        drasi.start().await.expect("Failed to start DrasiLib");
+        timeout(
+            Duration::from_secs(10),
+            drasi
+                .computation_component("test-pg-source")
+                .expect("source handle")
+                .wait_started(),
         )
         .await
-        .expect("Failed to create table");
+        .expect("PostgreSQL source startup timed out")
+        .expect("PostgreSQL source startup failed");
 
-    client
-        .execute("CREATE PUBLICATION drasi_pub FOR TABLE test_items", &[])
+        // Use the DrasiLib public API to get logs
+        let (mut history, mut receiver) = drasi
+            .subscribe_source_logs("test-pg-source")
+            .await
+            .expect("Failed to subscribe to source logs");
+        timeout(Duration::from_secs(5), async {
+            while history.len() < 2
+                || !history.iter().any(|log| {
+                    log.message.contains("replication") || log.message.contains("Starting")
+                })
+            {
+                history.push(receiver.recv().await.expect("source log stream closed"));
+            }
+        })
         .await
-        .expect("Failed to create publication");
+        .expect("PostgreSQL lifecycle logs were not observed");
 
-    // Create the PostgreSQL source
-    let source = PostgresReplicationSource::builder("test-pg-source")
-        .with_host(host.to_string())
-        .with_port(port)
-        .with_database("postgres")
-        .with_user("postgres")
-        .with_password("postgres")
-        .with_tables(vec!["test_items".to_string()])
-        .with_publication_name("drasi_pub")
-        .with_slot_name("test_slot")
-        .build()
-        .expect("Failed to build PostgreSQL source");
+        assert!(
+            !history.is_empty(),
+            "Expected logs to be captured for the PostgreSQL source"
+        );
 
-    // Create DrasiLib and add the source
-    let drasi = DrasiLib::builder()
-        .with_source(source)
-        .build()
-        .await
-        .expect("Failed to build DrasiLib");
-
-    drasi.start().await.expect("Failed to start DrasiLib");
-    timeout(
-        Duration::from_secs(10),
-        drasi
-            .computation_component("test-pg-source")
-            .expect("source handle")
-            .wait_started(),
-    )
-    .await
-    .expect("PostgreSQL source startup timed out")
-    .expect("PostgreSQL source startup failed");
-
-    // Use the DrasiLib public API to get logs
-    let (mut history, mut receiver) = drasi
-        .subscribe_source_logs("test-pg-source")
-        .await
-        .expect("Failed to subscribe to source logs");
-    timeout(Duration::from_secs(5), async {
-        while history.len() < 2
-            || !history
+        println!(
+            "All captured logs: {:?}",
+            history
                 .iter()
-                .any(|log| log.message.contains("replication") || log.message.contains("Starting"))
-        {
-            history.push(receiver.recv().await.expect("source log stream closed"));
-        }
+                .map(|l| format!("[{:?}] {}", l.level, l.message))
+                .collect::<Vec<_>>()
+        );
+
+        // Check for lifecycle logs
+        let has_lifecycle_log = history
+            .iter()
+            .any(|log| log.message.contains("replication") || log.message.contains("Starting"));
+        assert!(
+            has_lifecycle_log,
+            "Expected lifecycle logs, got: {:?}",
+            history.iter().map(|l| &l.message).collect::<Vec<_>>()
+        );
+
+        // Verify we captured multiple log entries from the postgres source
+        // Debug logs are filtered by default (INFO level); production code
+        // uses INFO/ERROR for important operational messages
+        assert!(
+            history.len() >= 2,
+            "Expected multiple log entries from postgres source, got: {:?}",
+            history
+                .iter()
+                .map(|l| format!("[{:?}] {}", l.level, l.message))
+                .collect::<Vec<_>>()
+        );
+
+        drasi.shutdown().await.expect("shutdown source");
     })
-    .await
-    .expect("PostgreSQL lifecycle logs were not observed");
-
-    assert!(
-        !history.is_empty(),
-        "Expected logs to be captured for the PostgreSQL source"
-    );
-
-    println!(
-        "All captured logs: {:?}",
-        history
-            .iter()
-            .map(|l| format!("[{:?}] {}", l.level, l.message))
-            .collect::<Vec<_>>()
-    );
-
-    // Check for lifecycle logs
-    let has_lifecycle_log = history
-        .iter()
-        .any(|log| log.message.contains("replication") || log.message.contains("Starting"));
-    assert!(
-        has_lifecycle_log,
-        "Expected lifecycle logs, got: {:?}",
-        history.iter().map(|l| &l.message).collect::<Vec<_>>()
-    );
-
-    // Verify we captured multiple log entries from the postgres source
-    // Debug logs are filtered by default (INFO level); production code
-    // uses INFO/ERROR for important operational messages
-    assert!(
-        history.len() >= 2,
-        "Expected multiple log entries from postgres source, got: {:?}",
-        history
-            .iter()
-            .map(|l| format!("[{:?}] {}", l.level, l.message))
-            .collect::<Vec<_>>()
-    );
-
-    drasi.stop().await.ok();
+    .await;
 }
 
 /// Test that error logs are captured when PostgreSQL source fails to connect.
@@ -175,153 +182,165 @@ async fn test_postgres_source_logs_captured_on_success() {
 #[tokio::test]
 #[serial]
 async fn test_postgres_source_logs_captured_on_connection_failure() {
-    // Create a source pointing to a non-existent database
-    let source = PostgresReplicationSource::builder("failing-pg-source")
-        .with_host("localhost")
-        .with_port(59999) // Non-existent port
-        .with_database("nonexistent_db")
-        .with_user("postgres")
-        .with_password("postgres")
-        .with_tables(vec!["test_table".to_string()])
-        .build()
-        .expect("Failed to build PostgreSQL source");
+    with_component_logs(async {
+        // Create a source pointing to a non-existent database
+        let source = PostgresReplicationSource::builder("failing-pg-source")
+            .with_host("localhost")
+            .with_port(59999) // Non-existent port
+            .with_database("nonexistent_db")
+            .with_user("postgres")
+            .with_password("postgres")
+            .with_tables(vec!["test_table".to_string()])
+            .build()
+            .expect("Failed to build PostgreSQL source");
 
-    // Create DrasiLib and add the source
-    let drasi = DrasiLib::builder()
-        .with_source(source)
-        .build()
+        // Create DrasiLib and add the source
+        let drasi = DrasiLib::builder()
+            .with_source(source)
+            .build()
+            .await
+            .expect("Failed to build DrasiLib");
+
+        let _ = drasi.start().await;
+        let source = drasi
+            .computation_component("failing-pg-source")
+            .expect("source handle");
+        let start_result = timeout(Duration::from_secs(5), source.wait_started())
+            .await
+            .expect("connection failure did not complete");
+        assert!(
+            start_result.is_err(),
+            "Expected start to fail with connection error"
+        );
+
+        assert_eq!(
+            drasi.get_source_status("failing-pg-source").await.unwrap(),
+            ComponentStatus::Error
+        );
+
+        // Use the DrasiLib public API to get logs
+        let (mut history, mut receiver) = drasi
+            .subscribe_source_logs("failing-pg-source")
+            .await
+            .expect("Failed to subscribe to source logs");
+        timeout(Duration::from_secs(5), async {
+            while !history.iter().any(|log| {
+                log.level == LogLevel::Error
+                    || log.message.to_lowercase().contains("error")
+                    || log.message.to_lowercase().contains("failed")
+                    || log.message.to_lowercase().contains("connection")
+            }) {
+                history.push(receiver.recv().await.expect("source log stream closed"));
+            }
+        })
         .await
-        .expect("Failed to build DrasiLib");
+        .expect("connection failure logs were not observed");
 
-    let _ = drasi.start().await;
-    let source = drasi
-        .computation_component("failing-pg-source")
-        .expect("source handle");
-    let start_result = timeout(Duration::from_secs(5), source.wait_started())
-        .await
-        .expect("connection failure did not complete");
-    assert!(
-        start_result.is_err(),
-        "Expected start to fail with connection error"
-    );
+        // Should have at least lifecycle logs
+        assert!(
+            !history.is_empty(),
+            "Expected logs to be captured for the failing PostgreSQL source"
+        );
 
-    assert_eq!(
-        drasi.get_source_status("failing-pg-source").await.unwrap(),
-        ComponentStatus::Error
-    );
-
-    // Use the DrasiLib public API to get logs
-    let (mut history, mut receiver) = drasi
-        .subscribe_source_logs("failing-pg-source")
-        .await
-        .expect("Failed to subscribe to source logs");
-    timeout(Duration::from_secs(5), async {
-        while !history.iter().any(|log| {
+        // Look for error logs from the connection failure
+        let has_error_log = history.iter().any(|log| {
             log.level == LogLevel::Error
                 || log.message.to_lowercase().contains("error")
                 || log.message.to_lowercase().contains("failed")
                 || log.message.to_lowercase().contains("connection")
-        }) {
-            history.push(receiver.recv().await.expect("source log stream closed"));
+        });
+
+        println!(
+            "Captured logs via DrasiLib API: {:?}",
+            history
+                .iter()
+                .map(|l| format!("[{:?}] {}", l.level, l.message))
+                .collect::<Vec<_>>()
+        );
+
+        assert!(
+            has_error_log,
+            "Expected error logs from connection failure, got: {:?}",
+            history
+                .iter()
+                .map(|l| format!("[{:?}] {}", l.level, l.message))
+                .collect::<Vec<_>>()
+        );
+
+        if let Err(error) = drasi.shutdown().await {
+            assert!(
+                format!("{error:#}").contains("PostgreSQL replication failed during startup"),
+                "unexpected shutdown failure: {error:#}"
+            );
         }
     })
-    .await
-    .expect("connection failure logs were not observed");
-
-    // Should have at least lifecycle logs
-    assert!(
-        !history.is_empty(),
-        "Expected logs to be captured for the failing PostgreSQL source"
-    );
-
-    // Look for error logs from the connection failure
-    let has_error_log = history.iter().any(|log| {
-        log.level == LogLevel::Error
-            || log.message.to_lowercase().contains("error")
-            || log.message.to_lowercase().contains("failed")
-            || log.message.to_lowercase().contains("connection")
-    });
-
-    println!(
-        "Captured logs via DrasiLib API: {:?}",
-        history
-            .iter()
-            .map(|l| format!("[{:?}] {}", l.level, l.message))
-            .collect::<Vec<_>>()
-    );
-
-    assert!(
-        has_error_log,
-        "Expected error logs from connection failure, got: {:?}",
-        history
-            .iter()
-            .map(|l| format!("[{:?}] {}", l.level, l.message))
-            .collect::<Vec<_>>()
-    );
-
-    drasi.stop().await.ok();
+    .await;
 }
 
 /// Test that log streaming works for PostgreSQL source via DrasiLib API.
 #[tokio::test]
 #[serial]
 async fn test_postgres_source_log_streaming() {
-    // Create a source pointing to a non-existent port (will fail quickly)
-    let source = PostgresReplicationSource::builder("streaming-pg-source")
-        .with_host("localhost")
-        .with_port(59998) // Non-existent port
-        .with_database("test_db")
-        .with_user("postgres")
-        .with_password("postgres")
-        .with_tables(vec!["test".to_string()])
-        .build()
-        .expect("Failed to build PostgreSQL source");
+    with_component_logs(async {
+        // Create a source pointing to a non-existent port (will fail quickly)
+        let source = PostgresReplicationSource::builder("streaming-pg-source")
+            .with_host("localhost")
+            .with_port(59998) // Non-existent port
+            .with_database("test_db")
+            .with_user("postgres")
+            .with_password("postgres")
+            .with_tables(vec!["test".to_string()])
+            .build()
+            .expect("Failed to build PostgreSQL source");
 
-    let drasi = DrasiLib::builder()
-        .with_source(source)
-        .build()
-        .await
-        .expect("Failed to build DrasiLib");
+        let drasi = DrasiLib::builder()
+            .with_source(source)
+            .build()
+            .await
+            .expect("Failed to build DrasiLib");
 
-    // Subscribe to logs BEFORE starting using the DrasiLib public API
-    let (initial_history, mut log_stream) = drasi
-        .subscribe_source_logs("streaming-pg-source")
-        .await
-        .expect("Failed to subscribe to source logs");
+        // Subscribe to logs BEFORE starting using the DrasiLib public API
+        let (initial_history, mut log_stream) = drasi
+            .subscribe_source_logs("streaming-pg-source")
+            .await
+            .expect("Failed to subscribe to source logs");
 
-    // Initial history should be empty before start
-    println!("Initial history before start: {initial_history:?}");
+        // Initial history should be empty before start
+        println!("Initial history before start: {initial_history:?}");
 
-    // start() will fail because the source cannot connect, but logs should
-    // still be streamed during the attempt.
-    let _start_result = drasi.start().await;
+        // start() will fail because the source cannot connect, but logs should
+        // still be streamed during the attempt.
+        let _start_result = drasi.start().await;
 
-    // Wait for logs to stream in
-    let mut received_logs = Vec::new();
-    let _collect_result = timeout(Duration::from_secs(5), async {
-        while let Ok(log) = log_stream.recv().await {
-            received_logs.push(log);
-            // Collect a few logs then stop
-            if received_logs.len() >= 2 {
-                break;
+        // Wait for logs to stream in
+        let mut received_logs = Vec::new();
+        let _collect_result = timeout(Duration::from_secs(5), async {
+            while let Ok(log) = log_stream.recv().await {
+                received_logs.push(log);
+                // Collect a few logs then stop
+                if received_logs.len() >= 2 {
+                    break;
+                }
             }
-        }
+        })
+        .await;
+
+        drasi.stop().await.ok();
+
+        // We should have received at least some logs via streaming
+        assert!(
+            !received_logs.is_empty(),
+            "Expected to receive logs via streaming"
+        );
+
+        println!(
+            "Streamed logs via DrasiLib API: {:?}",
+            received_logs
+                .iter()
+                .map(|l| format!("[{:?}] {}", l.level, l.message))
+                .collect::<Vec<_>>()
+        );
+        drasi.shutdown().await.expect("shutdown source");
     })
     .await;
-
-    drasi.stop().await.ok();
-
-    // We should have received at least some logs via streaming
-    assert!(
-        !received_logs.is_empty(),
-        "Expected to receive logs via streaming"
-    );
-
-    println!(
-        "Streamed logs via DrasiLib API: {:?}",
-        received_logs
-            .iter()
-            .map(|l| format!("[{:?}] {}", l.level, l.message))
-            .collect::<Vec<_>>()
-    );
 }

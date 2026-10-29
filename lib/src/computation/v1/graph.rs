@@ -647,6 +647,7 @@ impl Component {
 /// One producer output cannot route to multiple input ports of the same component:
 /// independent queues would not preserve component-wide FIFO for that stream.
 pub struct ComputationGraphBuilder {
+    telemetry: crate::observability::TelemetrySettings,
     id: Arc<str>,
     components: Vec<Component>,
     edges: Vec<(EdgeDefinition, Box<dyn PipeProvider>)>,
@@ -667,6 +668,12 @@ pub struct ComputationGraphBuilder {
 }
 
 impl ComputationGraphBuilder {
+    /// Configure collection without installing process-global infrastructure.
+    pub fn with_telemetry(mut self, settings: crate::observability::TelemetrySettings) -> Self {
+        self.telemetry = settings;
+        self
+    }
+
     pub fn require_recovery(mut self, requirement: super::RecoveryRequirement) -> Self {
         self.recovery_requirements.push(requirement);
         self
@@ -674,6 +681,11 @@ impl ComputationGraphBuilder {
 
     /// Build component declarations and bindings without starting their execution.
     pub fn build_components(self) -> GraphResult<super::ComponentBatch> {
+        if self.telemetry.traces || self.telemetry.metrics {
+            return Err(topology(
+                "telemetry settings belong to the owning graph, not a component batch",
+            ));
+        }
         self.build()?.into_component_batch()
     }
 
@@ -834,6 +846,9 @@ impl ComputationGraphBuilder {
     }
 
     pub fn build(mut self) -> GraphResult<ComputationGraph> {
+        self.telemetry
+            .validate()
+            .map_err(|error| topology(format!("invalid telemetry settings: {error:#}")))?;
         validate_identifier("graph", &self.id)?;
         if self
             .resource_constructors
@@ -1272,6 +1287,7 @@ impl ComputationGraphBuilder {
         )))
         .0;
         let graph = ComputationGraph {
+            telemetry: self.telemetry,
             execution_scope: snapshot.id.clone(),
             inspector: super::ComputationInspector::new(&snapshot, Arc::new(observed.clone())),
             next_edge: snapshot.edges.len(),
@@ -1478,6 +1494,7 @@ impl GraphControl {
 /// quarantines the construction generation even after a successful stop.
 /// Components owning external workers must retain and join them in their hooks.
 pub struct ComputationGraph {
+    pub(crate) telemetry: crate::observability::TelemetrySettings,
     snapshot: GraphSnapshot,
     // Stable runtime indices survive compact desired snapshots and removals.
     nodes: Vec<NodeSnapshot>,
@@ -1570,6 +1587,7 @@ impl ComputationGraph {
     }
     pub fn builder(id: impl Into<Arc<str>>) -> ComputationGraphBuilder {
         ComputationGraphBuilder {
+            telemetry: crate::observability::TelemetrySettings::default(),
             id: id.into(),
             components: Vec::new(),
             edges: Vec::new(),
@@ -2148,6 +2166,7 @@ struct Incoming {
 }
 
 struct Outgoing {
+    queue_id: Arc<str>,
     edge: usize,
     port: PortId,
     sender: Arc<dyn EnvelopeSender>,
@@ -2656,7 +2675,10 @@ async fn run_node(
     budget: &NodeWorkBudget,
     sink_batch: &mut Option<Box<sink_batching::SinkBatchState>>,
     input_progress: &mut Option<Box<input_progress::InputProgress>>,
+    telemetry: Option<&crate::observability::ComponentTelemetry>,
 ) -> GraphResult<()> {
+    use crate::observability::{observe_component, ExecutionContext, ObservedOperation};
+    use tracing::Instrument;
     validate_source_progress(
         component,
         routing.graph_id,
@@ -2726,12 +2748,15 @@ async fn run_node(
         let mut acknowledgement = None;
         let mut consumed = None;
         let mut handled_input = None;
+        let mut execution = ExecutionContext::default();
         let mut emissions = match component {
             Component::Source(source) => {
                 match tokio::select! {
                     biased;
                     _ = cancelled(quiesce) => return Ok(()),
-                    result = source.next() => result.map_err(|source| component_error(node, "next", source))?,
+                    result = observe_component(
+                        telemetry, ObservedOperation::Next, &execution, None, source.next(),
+                    ) => result.0.map_err(|source| component_error(node, "next", source))?,
                 } {
                     Some(output) => vec![output],
                     None => {
@@ -2745,9 +2770,18 @@ async fn run_node(
                     component
                 {
                     if transformer.has_pending_emissions() {
-                        break 'input_work transformer.continue_transform().await.map_err(
-                            |source| component_error(node, "recovered processing", source),
-                        )?;
+                        let (result, context) = observe_component(
+                            telemetry,
+                            ObservedOperation::Replay,
+                            &execution,
+                            None,
+                            transformer.continue_transform(),
+                        )
+                        .await;
+                        execution = context;
+                        break 'input_work result.map_err(|source| {
+                            component_error(node, "recovered processing", source)
+                        })?;
                     }
                 }
                 if ready.is_empty() {
@@ -2832,7 +2866,8 @@ async fn run_node(
                 let incoming = ready.remove(chosen);
                 let PendingInput { delivery, work } =
                     incoming.pending.take().expect("ready delivery");
-                let (envelope, completion) = delivery.into_parts();
+                let (envelope, completion, context) = delivery.into_execution_parts();
+                execution = context;
                 if completion.is_some() != incoming.acknowledgement_required {
                     return Err(topology(
                         "pipe delivery acknowledgement differs from its negotiated capability",
@@ -2874,15 +2909,42 @@ async fn run_node(
                 }
                 match component {
                     Component::Transformer(transformer) | Component::Query(transformer) => {
-                        transformer
-                            .transform(input)
-                            .await
-                            .map_err(|source| component_error(node, "transform", source))?
+                        let result = if telemetry.is_some() {
+                            let port = input.port.clone();
+                            let change_count = input.envelope.changes().operations().len();
+                            let (result, context) = observe_component(
+                                telemetry,
+                                ObservedOperation::Transform,
+                                &execution,
+                                Some((port.as_str(), change_count, None)),
+                                transformer.transform(input),
+                            )
+                            .await;
+                            execution = context;
+                            result
+                        } else {
+                            transformer.transform(input).await
+                        };
+                        result.map_err(|source| component_error(node, "transform", source))?
                     }
                     Component::Sink(sink) => {
-                        sink.handle(input)
-                            .await
-                            .map_err(|source| component_error(node, "handle", source))?;
+                        let result = if telemetry.is_some() {
+                            let port = input.port.clone();
+                            let change_count = input.envelope.changes().operations().len();
+                            let (result, context) = observe_component(
+                                telemetry,
+                                ObservedOperation::Handle,
+                                &execution,
+                                Some((port.as_str(), change_count, node.completion)),
+                                sink.handle(input),
+                            )
+                            .await;
+                            execution = context;
+                            result
+                        } else {
+                            sink.handle(input).await
+                        };
+                        result.map_err(|source| component_error(node, "handle", source))?;
                         Vec::new()
                     }
                     Component::Source(_) | Component::Service(_) => unreachable!(),
@@ -2892,85 +2954,169 @@ async fn run_node(
                 }
             }
         };
-        loop {
-            if handled_input.as_ref().is_some_and(|input| input.duplicate) {
-                break;
-            }
-            check_descriptor(component, node)?;
-            validate_emissions(node, sequences, &emissions)?;
-            // The input/continuation already paid for its first forward.
-            let mut first_branch = true;
-            for emission in &emissions {
-                if !outputs.iter().any(|output| output.port == emission.port) {
-                    return Err(emission_error(
-                        node,
-                        "output port has no bound relationship",
-                    ));
+        let mut publication = if matches!(component, Component::Source(_)) {
+            telemetry.map(|telemetry| telemetry.begin(ObservedOperation::Publish, &execution))
+        } else {
+            None
+        };
+        let publication_span = publication
+            .as_ref()
+            .map(|observation| {
+                observation.span.record("publication_mode", "polled");
+                observation.span.record(
+                    "change_count",
+                    emissions
+                        .iter()
+                        .map(|output| output.envelope.changes().operations().len() as u64)
+                        .sum::<u64>(),
+                );
+                observation
+                    .span
+                    .record("output_count", emissions.len() as u64);
+                if let Some(output) = emissions.first() {
+                    observation.span.record("output_port", output.port.as_str());
                 }
-                let mut multicast = BTreeSet::new();
-                let mut accepted_branches = 0;
-                for output in outputs.iter().filter(|output| output.port == emission.port) {
-                    if first_branch {
-                        first_branch = false;
-                    } else if let Some(yield_node) = budget.checkpoint() {
-                        yield_node.await;
+                execution = observation.context.clone();
+                observation.span.clone()
+            })
+            .unwrap_or_else(tracing::Span::none);
+        let forwarding = async {
+            loop {
+                if handled_input.as_ref().is_some_and(|input| input.duplicate) {
+                    break;
+                }
+                check_descriptor(component, node)?;
+                validate_emissions(node, sequences, &emissions)?;
+                if let Some(telemetry) = telemetry {
+                    telemetry.outputs(emissions.len());
+                }
+                // The input/continuation already paid for its first forward.
+                let mut first_branch = true;
+                for emission in &emissions {
+                    if !outputs.iter().any(|output| output.port == emission.port) {
+                        return Err(emission_error(
+                            node,
+                            "output port has no bound relationship",
+                        ));
                     }
-                    if output
-                        .multicast
-                        .as_ref()
-                        .is_some_and(|group| !multicast.insert(group.clone()))
-                    {
-                        continue;
-                    }
-                    output
-                        .sender
-                        .send(emission.envelope.clone())
-                        .await
-                        .map_err(|source| GraphError::Forward {
+                    let mut multicast = BTreeSet::new();
+                    let mut accepted_branches = 0;
+                    for output in outputs.iter().filter(|output| output.port == emission.port) {
+                        if first_branch {
+                            first_branch = false;
+                        } else if let Some(yield_node) = budget.checkpoint() {
+                            yield_node.await;
+                        }
+                        if output
+                            .multicast
+                            .as_ref()
+                            .is_some_and(|group| !multicast.insert(group.clone()))
+                        {
+                            continue;
+                        }
+                        let accepted = if let Some(telemetry) = telemetry {
+                            let send = async {
+                                if execution.trace.is_some() {
+                                    output
+                                        .sender
+                                        .send_with_context(
+                                            emission.envelope.clone(),
+                                            execution.clone(),
+                                        )
+                                        .await
+                                } else {
+                                    output.sender.send(emission.envelope.clone()).await
+                                }
+                            };
+                            Box::pin(telemetry.send(
+                                &output.queue_id,
+                                output.port.as_str(),
+                                &execution,
+                                send,
+                            ))
+                            .await
+                        } else if execution.trace.is_some() {
+                            output
+                                .sender
+                                .send_with_context(emission.envelope.clone(), execution.clone())
+                                .await
+                        } else {
+                            output.sender.send(emission.envelope.clone()).await
+                        };
+                        accepted.map_err(|source| GraphError::Forward {
                             edge: output.edge,
                             accepted_branches,
                             source: Box::new(source),
                         })?;
-                    accepted_branches += match &output.multicast {
-                        Some(group) => outputs
-                            .iter()
-                            .filter(|branch| {
-                                branch.port == emission.port
-                                    && branch.multicast.as_ref() == Some(group)
-                            })
-                            .count(),
-                        None => 1,
-                    };
+                        accepted_branches += match &output.multicast {
+                            Some(group) => outputs
+                                .iter()
+                                .filter(|branch| {
+                                    branch.port == emission.port
+                                        && branch.multicast.as_ref() == Some(group)
+                                })
+                                .count(),
+                            None => 1,
+                        };
+                    }
+                    if matches!(component, Component::Source(_)) {
+                        if let Some(telemetry) = telemetry {
+                            telemetry.dispatched(1);
+                        }
+                    }
                 }
-            }
-            match component {
-                Component::Transformer(transformer) | Component::Query(transformer) => {
-                    transformer
-                        .delivery_completed(&emissions)
-                        .await
-                        .map_err(|source| component_error(node, "complete delivery", source))?;
-                }
-                _ => {}
-            }
-            let continuation =
                 match component {
+                    Component::Transformer(transformer) | Component::Query(transformer) => {
+                        transformer
+                            .delivery_completed(&emissions)
+                            .await
+                            .map_err(|source| component_error(node, "complete delivery", source))?;
+                    }
+                    _ => {}
+                }
+                let continuation = match component {
                     Component::Transformer(transformer) | Component::Query(transformer)
                         if transformer.has_pending_emissions() =>
                     {
                         if let Some(yield_node) = budget.checkpoint() {
                             yield_node.await;
                         }
-                        Some(transformer.continue_transform().await.map_err(|source| {
+                        let (result, context) = observe_component(
+                            telemetry,
+                            ObservedOperation::Continue,
+                            &execution,
+                            None,
+                            transformer.continue_transform(),
+                        )
+                        .await;
+                        execution = context;
+                        Some(result.map_err(|source| {
                             component_error(node, "continue transform", source)
                         })?)
                     }
                     _ => None,
                 };
-            match continuation {
-                Some(next) => emissions = next,
-                None => break,
+                match continuation {
+                    Some(next) => emissions = next,
+                    None => break,
+                }
+            }
+            Ok::<_, GraphError>(())
+        };
+        let forwarding = if publication.is_some() {
+            forwarding.instrument(publication_span).await
+        } else {
+            forwarding.await
+        };
+        if let Some(publication) = &mut publication {
+            publication.finish(forwarding.is_ok());
+        } else if matches!(&forwarding, Err(GraphError::Forward { .. })) {
+            if let Some(telemetry) = telemetry {
+                telemetry.forwarding_failed();
             }
         }
+        drop(publication);
+        forwarding?;
         if let (Some(progress), Some(input)) = (input_progress.as_mut(), handled_input) {
             progress.confirm([*input]);
         }

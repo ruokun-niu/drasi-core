@@ -23,6 +23,7 @@ use std::{
     },
 };
 use tokio::{sync::watch, task::JoinHandle};
+use tracing::instrument::WithSubscriber;
 
 use super::v1::{
     ComponentBatch, ComputationGraph, DeploymentReport, DesiredMutation, GraphControl, GraphError,
@@ -347,8 +348,16 @@ impl Entry {
             });
                 publication.finish(outcome);
             };
-        crate::context::workers::try_spawn_owned_worker(&entry.task, work)
-            .expect("new instance owns a vacant driver slot");
+        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+        let spawned = if dispatcher.is::<tracing::subscriber::NoSubscriber>() {
+            crate::context::workers::try_spawn_owned_worker(&entry.task, work)
+        } else {
+            crate::context::workers::try_spawn_owned_worker(
+                &entry.task,
+                work.with_subscriber(dispatcher),
+            )
+        };
+        spawned.expect("new instance owns a vacant driver slot");
         entry
     }
 
@@ -542,16 +551,21 @@ pub(crate) struct InstanceGraph {
     /// Serializes instance-wide lifecycle operations.
     pub(crate) lifecycle: tokio::sync::Mutex<InstanceLifecycle>,
     instance_id: String,
+    telemetry: crate::observability::TelemetrySettings,
     entry: Mutex<Option<Arc<Entry>>>,
     pending: Mutex<Vec<Arc<PendingComponents>>>,
     closed: AtomicBool,
 }
 
 impl InstanceGraph {
-    pub(crate) fn new(instance_id: String) -> Self {
+    pub(crate) fn new(
+        instance_id: String,
+        telemetry: crate::observability::TelemetrySettings,
+    ) -> Self {
         Self {
             lifecycle: tokio::sync::Mutex::default(),
             instance_id,
+            telemetry,
             entry: Mutex::new(None),
             pending: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
@@ -657,7 +671,11 @@ impl InstanceGraph {
             entry.request_shutdown();
         }
     }
-    pub(crate) async fn initialize(&self, graph: ComputationGraph) -> Result<ComputationHandle> {
+    pub(crate) async fn initialize(
+        &self,
+        mut graph: ComputationGraph,
+    ) -> Result<ComputationHandle> {
+        graph.telemetry = self.telemetry.clone();
         let entry = {
             let mut current = self
                 .entry

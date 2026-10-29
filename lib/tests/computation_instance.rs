@@ -247,17 +247,26 @@ async fn instance_lifecycle() {
         .is_err());
     assert!(drasi.start().await.is_err());
 }
+#[path = "support/logging.rs"]
+mod logging;
+
 #[tokio::test(flavor = "current_thread")]
 async fn managed_driver_runs_and_restarts_on_current_thread() {
-    tokio::time::timeout(Duration::from_secs(15), instance_lifecycle())
-        .await
-        .expect("deadlock");
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        logging::with_component_logs(instance_lifecycle()),
+    )
+    .await
+    .expect("deadlock");
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn managed_driver_runs_and_restarts_on_multiple_threads() {
-    tokio::time::timeout(Duration::from_secs(15), instance_lifecycle())
-        .await
-        .expect("deadlock");
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        logging::with_component_logs(instance_lifecycle()),
+    )
+    .await
+    .expect("deadlock");
 }
 
 struct RoleLogger(ComponentDescriptor);
@@ -411,7 +420,7 @@ async fn native_role_logs(instance_id: &str) {
 async fn native_roles_preserve_log_history_and_streams_on_current_thread() {
     tokio::time::timeout(
         Duration::from_secs(15),
-        native_role_logs("role-logs-current"),
+        logging::with_component_logs(native_role_logs("role-logs-current")),
     )
     .await
     .expect("native log qualification stalled");
@@ -419,9 +428,12 @@ async fn native_roles_preserve_log_history_and_streams_on_current_thread() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_roles_preserve_log_history_and_streams_on_multiple_threads() {
-    tokio::time::timeout(Duration::from_secs(15), native_role_logs("role-logs-multi"))
-        .await
-        .expect("native log qualification stalled");
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        logging::with_component_logs(native_role_logs("role-logs-multi")),
+    )
+    .await
+    .expect("native log qualification stalled");
 }
 
 #[tokio::test]

@@ -45,6 +45,19 @@ pub(crate) mod checkpoints;
 pub(crate) mod managers;
 mod runtime_behavior;
 
+pub(crate) async fn with_component_logs(work: impl std::future::Future<Output = ()>) {
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    static BRIDGE: std::sync::Once = std::sync::Once::new();
+    BRIDGE.call_once(|| tracing_log::LogTracer::init().expect("install test-host log bridge"));
+    let runtime = crate::observability::init_component_logging()
+        .await
+        .unwrap();
+    let subscriber = tracing_subscriber::registry().with(runtime.layer());
+    work.with_subscriber(subscriber).await;
+    runtime.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
 pub(crate) fn native_query_value(
     value: &drasi_core::evaluation::variable_value::VariableValue,
 ) -> serde_json::Value {

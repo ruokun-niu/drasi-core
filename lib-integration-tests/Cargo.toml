@@ -52,3 +52,5 @@ axum = "0.8"
 tonic = "0.14"
 prost-types = "0.14"
 tokio-stream = { version = "0.1", features = ["net"] }
+tracing-subscriber = "0.3"
+tracing-log = "0.2"

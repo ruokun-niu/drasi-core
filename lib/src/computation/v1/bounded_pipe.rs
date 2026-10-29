@@ -35,6 +35,17 @@ use super::{
 /// This handle must not retain a sender or keep a drained receiver alive.
 #[async_trait]
 pub trait PipeControl: Send + Sync {
+    fn supports_telemetry(&self) -> bool {
+        false
+    }
+    fn bind_telemetry(
+        &self,
+        _telemetry: crate::observability::QueueTelemetry,
+    ) -> Result<(), PipeError> {
+        Err(PipeError::Backend(anyhow::anyhow!(
+            "pipe does not expose telemetry updates"
+        )))
+    }
     fn close(&self);
     fn cancel(&self);
     /// Authoritative absence of buffered/replayable or provider-in-flight
@@ -305,6 +316,15 @@ struct Control(watch::Sender<Closure>, PipeMetrics, AtomicUsize);
 
 #[async_trait]
 impl PipeControl for Control {
+    fn supports_telemetry(&self) -> bool {
+        true
+    }
+    fn bind_telemetry(
+        &self,
+        telemetry: crate::observability::QueueTelemetry,
+    ) -> Result<(), PipeError> {
+        self.1.bind_telemetry(telemetry)
+    }
     async fn is_idle(&self) -> Result<bool, PipeError> {
         if *self.0.borrow() == Closure::Cancelled {
             return Err(PipeError::Closed);
@@ -331,16 +351,43 @@ impl PipeControl for Control {
 }
 
 struct Sender<T: QueuedEnvelope> {
-    sender: mpsc::Sender<T>,
+    sender: mpsc::Sender<QueueEntry<T>>,
     control: Arc<Control>,
     budget: T::Budget,
 }
 
+struct QueueEntry<T> {
+    envelope: T,
+    execution: Option<Box<crate::observability::ExecutionContext>>,
+}
+
 #[async_trait]
 impl<T: QueuedEnvelope> EnvelopeSender for Sender<T> {
+    fn supports_execution_context(&self) -> bool {
+        true
+    }
     async fn send(
         &self,
         envelope: ChangeEnvelope,
+    ) -> std::result::Result<EnqueueReceipt, SendFailure> {
+        self.send_context(envelope, None).await
+    }
+
+    async fn send_with_context(
+        &self,
+        envelope: ChangeEnvelope,
+        context: crate::observability::ExecutionContext,
+    ) -> std::result::Result<EnqueueReceipt, SendFailure> {
+        let context = context.trace.is_some().then(|| Box::new(context));
+        self.send_context(envelope, context).await
+    }
+}
+
+impl<T: QueuedEnvelope> Sender<T> {
+    async fn send_context(
+        &self,
+        envelope: ChangeEnvelope,
+        execution: Option<Box<crate::observability::ExecutionContext>>,
     ) -> std::result::Result<EnqueueReceipt, SendFailure> {
         let mut closure = self.control.0.subscribe();
         let counted_wait = self.sender.capacity() == 0 && *self.control.0.borrow() == Closure::Open;
@@ -366,7 +413,10 @@ impl<T: QueuedEnvelope> EnvelopeSender for Sender<T> {
                 let receipt = EnqueueReceipt::new(envelope.id().clone());
                 self.control.1.accepted();
                 self.control.2.fetch_add(1, Ordering::AcqRel);
-                permit.send(T::queued(envelope, reservation));
+                permit.send(QueueEntry {
+                    envelope: T::queued(envelope, reservation),
+                    execution,
+                });
                 Ok(receipt)
             }
             result => Err(SendFailure {
@@ -378,7 +428,7 @@ impl<T: QueuedEnvelope> EnvelopeSender for Sender<T> {
 }
 
 struct Receiver<T: QueuedEnvelope> {
-    receiver: mpsc::Receiver<T>,
+    receiver: mpsc::Receiver<QueueEntry<T>>,
     control: Arc<Control>,
 }
 
@@ -410,7 +460,8 @@ impl<T: QueuedEnvelope> EnvelopeReceiver for Receiver<T> {
                     return Ok(envelope.map(|envelope| {
                         self.control.1.delivered();
                         self.control.2.fetch_sub(1, Ordering::AcqRel);
-                        Delivery::new(envelope.into_envelope(), None)
+                        Delivery::new(envelope.envelope.into_envelope(), None)
+                            .with_execution_context(envelope.execution.map(|context| *context).unwrap_or_default())
                     }));
                 }
             }

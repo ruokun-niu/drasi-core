@@ -47,6 +47,7 @@ use crate::computation::v1::{
 };
 
 pub(super) struct InstanceSlot {
+    telemetry: std::sync::OnceLock<Arc<crate::observability::ComponentTelemetry>>,
     pub(super) id: ComponentId,
     pub(super) generation: ComponentGeneration,
     value: Mutex<Option<Instance>>,
@@ -92,6 +93,7 @@ impl InstanceSlot {
         generation: ComponentGeneration,
     ) -> Arc<Self> {
         let slot = Arc::new(Self {
+            telemetry: std::sync::OnceLock::new(),
             id,
             generation,
             configuration: Mutex::new(super::CapturedComponentConfiguration::Unavailable {
@@ -1222,6 +1224,19 @@ pub(super) fn update(graph: &ComputationGraph, change: impl FnOnce(&mut Observed
     graph
         .observed
         .send_modify(|snapshot| change(Arc::make_mut(snapshot)));
+    if graph.telemetry.metrics {
+        let observed = graph.observed.borrow();
+        for slot in &graph.components {
+            if let Some(telemetry) = slot.telemetry.get() {
+                let up = observed.components.get(&slot.id).is_some_and(|component| {
+                    component.generation == slot.generation
+                        && component.lifecycle == ComponentLifecycle::Running
+                        && !component.exhausted
+                });
+                telemetry.set_up(up);
+            }
+        }
+    }
     super::registry::publish(graph);
     graph.inspector.publish(&graph.snapshot, graph.observed());
 }
@@ -2123,6 +2138,9 @@ fn construct_pipe(
     edge: &EdgeSnapshot,
 ) -> GraphResult<BoxFuture<'static, GraphResult<ProvidedBinding>>> {
     let provider = graph.providers[&index].clone();
+    let telemetry = graph.telemetry.clone();
+    let instance_id = graph.execution_scope.clone();
+    let graph_id = graph.snapshot.id.clone();
     let resources = graph.resource_handles.clone();
     let edge = edge.clone();
     let producer_role = graph.nodes[graph.ids[&edge.definition.from.component]].role;
@@ -2154,6 +2172,18 @@ fn construct_pipe(
                                         "created pipe differs from preflight capabilities",
                                     ));
                                 }
+                                let sender = provided.pipe.sender();
+                                if telemetry.traces && !sender.supports_execution_context() {
+                                    return Err(topology("connected tracing requires a context-capable pipe; this experiment supports bounded in-process pipes"));
+                                }
+                                let queue_id: Arc<str> = Arc::from(format!("pipe/{index}"));
+                                if telemetry.metrics && provided.control.supports_telemetry() {
+                                    provided.control.bind_telemetry(
+                                        crate::observability::QueueTelemetry::new(
+                                            &telemetry, &instance_id, &graph_id, &queue_id,
+                                        ),
+                                    ).map_err(|source| GraphError::Pipe { edge: index, source })?;
+                                }
                                 let receiver = provided.pipe.take_receiver().map_err(|source| {
                                     GraphError::Pipe {
                                         edge: index,
@@ -2162,9 +2192,10 @@ fn construct_pipe(
                                 })?;
                                 let progress = Arc::new(super::FlowProgress::default());
                                 let outgoing = Outgoing {
+                                    queue_id,
                                     edge: index,
                                     port: edge.definition.from.port.clone(),
-                                    sender: provided.pipe.sender(),
+                                    sender,
                                     progress: progress.clone(),
                                     multicast: provider
                                         .multicast_subscription()
@@ -3471,6 +3502,21 @@ impl Operations {
             action: operation.action(),
         };
         let work_identity = identity.clone();
+        let telemetry = (graph.telemetry.traces || graph.telemetry.metrics).then(|| {
+            slot.telemetry
+                .get_or_init(|| {
+                    Arc::new(crate::observability::ComponentTelemetry::new(
+                        &graph.telemetry,
+                        graph.execution_scope.clone(),
+                        graph.snapshot.id.clone(),
+                        Arc::from(node.descriptor.id().as_str()),
+                        node.role,
+                        node.descriptor.semantic_kind(),
+                        generation.0,
+                    ))
+                })
+                .clone()
+        });
         let span = tracing::info_span!("computation_component",
             instance_id = %graph.execution_scope,
             component_id = %node.descriptor.id(),
@@ -3573,10 +3619,20 @@ impl Operations {
                             source: error.source,
                         })?;
                         if operation == Operation::Reconfigure {
-                            tokio::time::timeout(timeout, lease.component.reconfigure(context))
-                                .await
-                                .map_err(|_| work_identity.interrupted("reconfiguration timeout"))?
-                                .map_err(|source| component_error(&node, "reconfigure", source))?;
+                            tokio::time::timeout(
+                                timeout,
+                                crate::observability::observe_component(
+                                    telemetry.as_deref(),
+                                    crate::observability::ObservedOperation::Reconfigure,
+                                    &crate::observability::ExecutionContext::default(),
+                                    None,
+                                    lease.component.reconfigure(context),
+                                ),
+                            )
+                            .await
+                            .map_err(|_| work_identity.interrupted("reconfiguration timeout"))?
+                            .0
+                            .map_err(|source| component_error(&node, "reconfigure", source))?;
                         } else {
                             let constructed =
                                 tokio::time::timeout(timeout, factory.create(context))
@@ -3710,11 +3766,32 @@ impl Operations {
                         lease.component.bind_control(control);
                     }
                     super::bind_inputs(&mut lease.component, &node, &admission_snapshot).await?;
-                    lease
-                        .component
-                        .start()
-                        .await
-                        .map_err(|source| component_error(&node, "start", source))?;
+                    if telemetry
+                        .as_ref()
+                        .is_some_and(|telemetry| telemetry.traces_enabled())
+                    {
+                        if let Component::Sink(sink) = &lease.component {
+                            if sink
+                                .batching()
+                                .map_err(|error| {
+                                    component_error(&node, "sink batch policy", error)
+                                })?
+                                .is_some()
+                            {
+                                return Err(topology("batch tracing is deferred in this experiment; use a single-input sink"));
+                            }
+                        }
+                    }
+                    crate::observability::observe_component(
+                        telemetry.as_deref(),
+                        crate::observability::ObservedOperation::Start,
+                        &crate::observability::ExecutionContext::default(),
+                        None,
+                        lease.component.start(),
+                    )
+                    .await
+                    .0
+                    .map_err(|source| component_error(&node, "start", source))?;
                     {
                         let Instance {
                             component, outputs, ..
@@ -3825,6 +3902,7 @@ impl Operations {
                             &budget,
                             sink_batch,
                             input_progress,
+                            telemetry.as_deref(),
                         ))
                         .await;
                     if result.is_ok() {
@@ -3840,11 +3918,16 @@ impl Operations {
                         .as_ref()
                         .map(|progress| progress.fence());
                     if lease.attempted {
-                        lease
-                            .component
-                            .stop()
-                            .await
-                            .map_err(|source| component_error(&node, "stop", source))?;
+                        crate::observability::observe_component(
+                            telemetry.as_deref(),
+                            crate::observability::ObservedOperation::Stop,
+                            &crate::observability::ExecutionContext::default(),
+                            None,
+                            lease.component.stop(),
+                        )
+                        .await
+                        .0
+                        .map_err(|source| component_error(&node, "stop", source))?;
                         lease.attempted = false;
                     }
                     if deprovision

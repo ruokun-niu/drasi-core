@@ -48,6 +48,7 @@ mod snapshot_consumer;
 mod source_schema;
 #[doc(hidden)]
 pub mod source_transaction;
+mod telemetry;
 pub mod workers;
 
 pub use binary_codec::*;
@@ -75,6 +76,7 @@ pub use snapshot::*;
 pub use snapshot_consumer::SnapshotConsumer;
 pub use source_schema::SourceSchemaReader;
 pub use source_transaction::*;
+pub use telemetry::{ExecutionContext, TraceContextError, TraceContextV1};
 
 /// Maximum opaque source cursor size, shared by plugin and runtime validation.
 pub const MAX_SOURCE_POSITION_BYTES: usize = 65_536;

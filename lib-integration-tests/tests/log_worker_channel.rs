@@ -18,7 +18,12 @@
 //! - The bounded channel log worker processes logs correctly
 //! - Logs work across different tokio runtime configurations
 //! - High volume logging doesn't cause unbounded memory growth
-//! - The worker thread is independent of the caller's runtime
+//! - The host explicitly owns and drains the worker on either runtime flavor
+
+#[path = "../../lib/tests/support/logging.rs"]
+mod logging;
+use logging::with_component_logs;
+use tracing::instrument::WithSubscriber;
 
 use async_trait::async_trait;
 use drasi_lib::{
@@ -254,395 +259,8 @@ async fn wait_for_running(drasi: &DrasiLib, component_id: &str) {
 /// Test that logs flow correctly through the bounded channel.
 #[tokio::test]
 async fn test_logs_flow_through_channel() {
-    let source = SimpleLogSource::new("channel-flow-source").expect("Failed to create source");
-
-    let drasi = DrasiLib::builder()
-        .with_source(source)
-        .build()
-        .await
-        .expect("Failed to build DrasiLib");
-
-    // Subscribe to logs
-    let (_history, mut log_receiver) = drasi
-        .subscribe_source_logs("channel-flow-source")
-        .await
-        .expect("Failed to subscribe to source logs");
-
-    // Start to trigger logging
-    drasi.start().await.expect("Failed to start DrasiLib");
-
-    // Wait for log to arrive
-    let received = timeout(Duration::from_secs(2), async {
-        let mut logs = Vec::new();
-        while let Ok(log) = log_receiver.recv().await {
-            logs.push(log);
-            if logs.iter().any(|l| l.message.contains("starting")) {
-                break;
-            }
-        }
-        logs
-    })
-    .await
-    .expect("Timeout waiting for logs");
-
-    assert!(!received.is_empty(), "Expected to receive at least one log");
-    assert!(
-        received.iter().any(|l| l.message.contains("starting")),
-        "Expected 'starting' log message"
-    );
-
-    drasi.stop().await.ok();
-}
-
-/// Test high volume logging doesn't cause issues.
-/// This verifies the bounded channel provides backpressure.
-#[tokio::test]
-async fn test_high_volume_logging() {
-    let log_count = 1000;
-    let source =
-        HighVolumeLogSource::new("high-volume-source", log_count).expect("Failed to create source");
-
-    let drasi = DrasiLib::builder()
-        .with_source(source)
-        .build()
-        .await
-        .expect("Failed to build DrasiLib");
-
-    // Subscribe to logs
-    let (_history, mut log_receiver) = drasi
-        .subscribe_source_logs("high-volume-source")
-        .await
-        .expect("Failed to subscribe to source logs");
-
-    // Start to trigger high volume logging
-    drasi.start().await.expect("Failed to start DrasiLib");
-
-    // Wait for source to reach Running (log emissions complete before this)
-    wait_for_running(&drasi, "high-volume-source").await;
-
-    // Collect logs - we may not get all of them if channel fills up
-    // but we should get a good number
-    let received = timeout(Duration::from_secs(5), async {
-        let mut logs = Vec::new();
-        let mut lagged_count = 0u64;
-        loop {
-            match tokio::time::timeout(Duration::from_millis(200), log_receiver.recv()).await {
-                Ok(Ok(log)) => logs.push(log),
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
-                    lagged_count += n;
-                    // Continue receiving after lag
-                    continue;
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
-                Err(_timeout) => break,
-            }
-        }
-        println!("Lagged (missed) messages: {lagged_count}");
-        logs
-    })
-    .await
-    .expect("Timeout collecting logs");
-
-    println!(
-        "Received {} logs out of {} emitted",
-        received.len(),
-        log_count
-    );
-
-    // We should receive at least some logs
-    // (many may be missed due to lag or channel capacity)
-    assert!(
-        !received.is_empty() || log_count == 0,
-        "Expected at least some logs, got 0"
-    );
-
-    // Verify logs have correct component info
-    for log in &received {
-        assert_eq!(log.component_id, "high-volume-source");
-        assert_eq!(log.level, LogLevel::Info);
-    }
-
-    drasi.stop().await.ok();
-}
-
-/// Test that the log worker works with multi-threaded runtime.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_multi_thread_runtime() {
-    let source = SimpleLogSource::new("multi-thread-source").expect("Failed to create source");
-
-    let drasi = DrasiLib::builder()
-        .with_source(source)
-        .build()
-        .await
-        .expect("Failed to build DrasiLib");
-
-    // Subscribe to logs
-    let (_history, mut log_receiver) = drasi
-        .subscribe_source_logs("multi-thread-source")
-        .await
-        .expect("Failed to subscribe to source logs");
-
-    // Start to trigger logging
-    drasi.start().await.expect("Failed to start DrasiLib");
-
-    // Wait for log
-    let received = timeout(Duration::from_secs(2), async {
-        let mut logs = Vec::new();
-        while let Ok(log) = log_receiver.recv().await {
-            logs.push(log);
-            if !logs.is_empty() {
-                break;
-            }
-        }
-        logs
-    })
-    .await
-    .expect("Timeout waiting for logs");
-
-    assert!(
-        !received.is_empty(),
-        "Expected logs in multi-thread runtime"
-    );
-
-    drasi.stop().await.ok();
-}
-
-/// Test that the log worker works with current-thread runtime.
-#[tokio::test(flavor = "current_thread")]
-async fn test_current_thread_runtime() {
-    let source = SimpleLogSource::new("current-thread-source").expect("Failed to create source");
-
-    let drasi = DrasiLib::builder()
-        .with_source(source)
-        .build()
-        .await
-        .expect("Failed to build DrasiLib");
-
-    // Subscribe to logs
-    let (_history, mut log_receiver) = drasi
-        .subscribe_source_logs("current-thread-source")
-        .await
-        .expect("Failed to subscribe to source logs");
-
-    // Start to trigger logging
-    drasi.start().await.expect("Failed to start DrasiLib");
-
-    // Wait for log
-    let received = timeout(Duration::from_secs(2), async {
-        let mut logs = Vec::new();
-        while let Ok(log) = log_receiver.recv().await {
-            logs.push(log);
-            if !logs.is_empty() {
-                break;
-            }
-        }
-        logs
-    })
-    .await
-    .expect("Timeout waiting for logs");
-
-    assert!(
-        !received.is_empty(),
-        "Expected logs in current-thread runtime"
-    );
-
-    drasi.stop().await.ok();
-}
-
-/// Test concurrent logging from multiple tasks.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_concurrent_logging_from_multiple_tasks() {
-    let source = SimpleLogSource::new("concurrent-log-source").expect("Failed to create source");
-
-    let instance_id = "concurrent-test-instance";
-    let drasi = DrasiLib::builder()
-        .with_id(instance_id)
-        .with_source(source)
-        .build()
-        .await
-        .expect("Failed to build DrasiLib");
-
-    drasi.start().await.expect("Failed to start DrasiLib");
-
-    // Wait for source to reach Running
-    wait_for_running(&drasi, "concurrent-log-source").await;
-
-    let source_id = "concurrent-log-source";
-
-    // Subscribe to logs
-    let (_history, mut log_receiver) = drasi
-        .subscribe_source_logs(source_id)
-        .await
-        .expect("Failed to subscribe to source logs");
-
-    // Spawn multiple tasks that log concurrently
-    let log_counter = Arc::new(AtomicUsize::new(0));
-    let tasks_count = 10;
-    let logs_per_task = 50;
-
-    let mut handles = Vec::new();
-    for task_id in 0..tasks_count {
-        let instance_id = instance_id.to_string();
-        let counter = log_counter.clone();
-
-        handles.push(tokio::spawn(async move {
-            let span = tracing::info_span!(
-                "concurrent_task",
-                instance_id = %instance_id,
-                component_id = "concurrent-log-source",
-                component_type = "source"
-            );
-
-            async move {
-                for i in 0..logs_per_task {
-                    tracing::info!("Task {} log {}", task_id, i);
-                    counter.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-            .instrument(span)
-            .await;
-        }));
-    }
-
-    // Wait for all tasks to complete
-    for handle in handles {
-        handle.await.expect("Task panicked");
-    }
-
-    let total_logged = log_counter.load(Ordering::SeqCst);
-    println!("Total logs emitted: {total_logged}");
-
-    // Collect logs
-    let received = timeout(Duration::from_secs(3), async {
-        let mut logs = Vec::new();
-        let mut lagged_count = 0u64;
-        loop {
-            match tokio::time::timeout(Duration::from_millis(200), log_receiver.recv()).await {
-                Ok(Ok(log)) => logs.push(log),
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
-                    lagged_count += n;
-                    continue;
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
-                Err(_timeout) => break,
-            }
-        }
-        println!("Lagged (missed) messages: {lagged_count}");
-        logs
-    })
-    .await
-    .expect("Timeout collecting logs");
-
-    println!(
-        "Received {} logs out of {} emitted",
-        received.len(),
-        total_logged
-    );
-
-    // We should receive at least some logs
-    // (Many may be missed due to lag or channel capacity)
-    // Note: This test verifies the system doesn't crash under concurrent load,
-    // not that all logs are received
-    assert!(
-        !received.is_empty() || total_logged == 0,
-        "Expected at least some concurrent logs, got 0"
-    );
-
-    // Verify all received logs have correct component info
-    for log in &received {
-        assert_eq!(log.component_id, source_id);
-    }
-
-    drasi.stop().await.ok();
-}
-
-/// Test that multiple DrasiLib instances can log independently.
-#[tokio::test]
-async fn test_multiple_drasi_instances_logging() {
-    // Create two DrasiLib instances with different IDs
-    let source1 = SimpleLogSource::new("instance1-source").expect("Failed to create source1");
-    let source2 = SimpleLogSource::new("instance2-source").expect("Failed to create source2");
-
-    let drasi1 = DrasiLib::builder()
-        .with_id("drasi-instance-1")
-        .with_source(source1)
-        .build()
-        .await
-        .expect("Failed to build DrasiLib 1");
-
-    let drasi2 = DrasiLib::builder()
-        .with_id("drasi-instance-2")
-        .with_source(source2)
-        .build()
-        .await
-        .expect("Failed to build DrasiLib 2");
-
-    // Subscribe to logs from both instances
-    let (_h1, mut receiver1) = drasi1
-        .subscribe_source_logs("instance1-source")
-        .await
-        .expect("Failed to subscribe to instance1 logs");
-
-    let (_h2, mut receiver2) = drasi2
-        .subscribe_source_logs("instance2-source")
-        .await
-        .expect("Failed to subscribe to instance2 logs");
-
-    // Start both instances
-    drasi1.start().await.expect("Failed to start DrasiLib 1");
-    drasi2.start().await.expect("Failed to start DrasiLib 2");
-
-    // Collect logs from both
-    let logs1 = timeout(Duration::from_secs(2), async {
-        let mut logs = Vec::new();
-        while let Ok(log) = receiver1.recv().await {
-            logs.push(log);
-            if !logs.is_empty() {
-                break;
-            }
-        }
-        logs
-    })
-    .await
-    .expect("Timeout waiting for instance1 logs");
-
-    let logs2 = timeout(Duration::from_secs(2), async {
-        let mut logs = Vec::new();
-        while let Ok(log) = receiver2.recv().await {
-            logs.push(log);
-            if !logs.is_empty() {
-                break;
-            }
-        }
-        logs
-    })
-    .await
-    .expect("Timeout waiting for instance2 logs");
-
-    // Verify both instances received their logs
-    assert!(!logs1.is_empty(), "Instance 1 should have received logs");
-    assert!(!logs2.is_empty(), "Instance 2 should have received logs");
-
-    // Verify logs are correctly attributed
-    assert!(
-        logs1.iter().all(|l| l.component_id == "instance1-source"),
-        "Instance 1 logs should have correct component_id"
-    );
-    assert!(
-        logs2.iter().all(|l| l.component_id == "instance2-source"),
-        "Instance 2 logs should have correct component_id"
-    );
-
-    drasi1.stop().await.ok();
-    drasi2.stop().await.ok();
-}
-
-/// Test log worker handles rapid start/stop cycles.
-#[tokio::test]
-async fn test_rapid_start_stop_cycles() {
-    for i in 0..5 {
-        let source_id = format!("rapid-cycle-source-{i}");
-        let source = SimpleLogSource::new(&source_id).expect("Failed to create source");
+    with_component_logs(async {
+        let source = SimpleLogSource::new("channel-flow-source").expect("Failed to create source");
 
         let drasi = DrasiLib::builder()
             .with_source(source)
@@ -650,67 +268,483 @@ async fn test_rapid_start_stop_cycles() {
             .await
             .expect("Failed to build DrasiLib");
 
-        // Subscribe
-        let (_history, mut receiver) = drasi
-            .subscribe_source_logs(&source_id)
+        // Subscribe to logs
+        let (_history, mut log_receiver) = drasi
+            .subscribe_source_logs("channel-flow-source")
             .await
-            .expect("Failed to subscribe");
+            .expect("Failed to subscribe to source logs");
 
-        // Rapid start
-        drasi.start().await.expect("Failed to start");
+        // Start to trigger logging
+        drasi.start().await.expect("Failed to start DrasiLib");
 
-        // Try to get at least one log
-        let _ = timeout(Duration::from_millis(200), async {
-            let _ = receiver.recv().await;
+        // Wait for log to arrive
+        let received = timeout(Duration::from_secs(2), async {
+            let mut logs = Vec::new();
+            while let Ok(log) = log_receiver.recv().await {
+                logs.push(log);
+                if logs.iter().any(|l| l.message.contains("starting")) {
+                    break;
+                }
+            }
+            logs
         })
-        .await;
+        .await
+        .expect("Timeout waiting for logs");
 
-        // Rapid stop
-        drasi.stop().await.ok();
-    }
+        assert!(!received.is_empty(), "Expected to receive at least one log");
+        assert!(
+            received.iter().any(|l| l.message.contains("starting")),
+            "Expected 'starting' log message"
+        );
 
-    // If we got here without panicking, the test passes
-    // This verifies the log worker handles cleanup correctly
+        drasi.shutdown().await.unwrap();
+    })
+    .await;
+}
+
+/// Test high volume logging doesn't cause issues.
+/// This verifies the bounded channel provides backpressure.
+#[tokio::test]
+async fn test_high_volume_logging() {
+    with_component_logs(async {
+        let log_count = 1000;
+        let source = HighVolumeLogSource::new("high-volume-source", log_count)
+            .expect("Failed to create source");
+
+        let drasi = DrasiLib::builder()
+            .with_source(source)
+            .build()
+            .await
+            .expect("Failed to build DrasiLib");
+
+        // Subscribe to logs
+        let (_history, mut log_receiver) = drasi
+            .subscribe_source_logs("high-volume-source")
+            .await
+            .expect("Failed to subscribe to source logs");
+
+        // Start to trigger high volume logging
+        drasi.start().await.expect("Failed to start DrasiLib");
+
+        // Wait for source to reach Running (log emissions complete before this)
+        wait_for_running(&drasi, "high-volume-source").await;
+
+        // Collect logs - we may not get all of them if channel fills up
+        // but we should get a good number
+        let received = timeout(Duration::from_secs(5), async {
+            let mut logs = Vec::new();
+            let mut lagged_count = 0u64;
+            loop {
+                match tokio::time::timeout(Duration::from_millis(200), log_receiver.recv()).await {
+                    Ok(Ok(log)) => logs.push(log),
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                        lagged_count += n;
+                        // Continue receiving after lag
+                        continue;
+                    }
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                    Err(_timeout) => break,
+                }
+            }
+            println!("Lagged (missed) messages: {lagged_count}");
+            logs
+        })
+        .await
+        .expect("Timeout collecting logs");
+
+        println!(
+            "Received {} logs out of {} emitted",
+            received.len(),
+            log_count
+        );
+
+        // We should receive at least some logs
+        // (many may be missed due to lag or channel capacity)
+        assert!(
+            !received.is_empty() || log_count == 0,
+            "Expected at least some logs, got 0"
+        );
+
+        // Verify logs have correct component info
+        for log in &received {
+            assert_eq!(log.component_id, "high-volume-source");
+            assert_eq!(log.level, LogLevel::Info);
+        }
+
+        drasi.shutdown().await.unwrap();
+    })
+    .await;
+}
+
+/// Test that the log worker works with multi-threaded runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multi_thread_runtime() {
+    with_component_logs(async {
+        let source = SimpleLogSource::new("multi-thread-source").expect("Failed to create source");
+
+        let drasi = DrasiLib::builder()
+            .with_source(source)
+            .build()
+            .await
+            .expect("Failed to build DrasiLib");
+
+        // Subscribe to logs
+        let (_history, mut log_receiver) = drasi
+            .subscribe_source_logs("multi-thread-source")
+            .await
+            .expect("Failed to subscribe to source logs");
+
+        // Start to trigger logging
+        drasi.start().await.expect("Failed to start DrasiLib");
+
+        // Wait for log
+        let received = timeout(Duration::from_secs(2), async {
+            let mut logs = Vec::new();
+            while let Ok(log) = log_receiver.recv().await {
+                logs.push(log);
+                if !logs.is_empty() {
+                    break;
+                }
+            }
+            logs
+        })
+        .await
+        .expect("Timeout waiting for logs");
+
+        assert!(
+            !received.is_empty(),
+            "Expected logs in multi-thread runtime"
+        );
+
+        drasi.shutdown().await.unwrap();
+    })
+    .await;
+}
+
+/// Test that the log worker works with current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
+async fn test_current_thread_runtime() {
+    with_component_logs(async {
+        let source =
+            SimpleLogSource::new("current-thread-source").expect("Failed to create source");
+
+        let drasi = DrasiLib::builder()
+            .with_source(source)
+            .build()
+            .await
+            .expect("Failed to build DrasiLib");
+
+        // Subscribe to logs
+        let (_history, mut log_receiver) = drasi
+            .subscribe_source_logs("current-thread-source")
+            .await
+            .expect("Failed to subscribe to source logs");
+
+        // Start to trigger logging
+        drasi.start().await.expect("Failed to start DrasiLib");
+
+        // Wait for log
+        let received = timeout(Duration::from_secs(2), async {
+            let mut logs = Vec::new();
+            while let Ok(log) = log_receiver.recv().await {
+                logs.push(log);
+                if !logs.is_empty() {
+                    break;
+                }
+            }
+            logs
+        })
+        .await
+        .expect("Timeout waiting for logs");
+
+        assert!(
+            !received.is_empty(),
+            "Expected logs in current-thread runtime"
+        );
+
+        drasi.shutdown().await.unwrap();
+    })
+    .await;
+}
+
+/// Test concurrent logging from multiple tasks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_logging_from_multiple_tasks() {
+    with_component_logs(async {
+        let source =
+            SimpleLogSource::new("concurrent-log-source").expect("Failed to create source");
+
+        let instance_id = "concurrent-test-instance";
+        let drasi = DrasiLib::builder()
+            .with_id(instance_id)
+            .with_source(source)
+            .build()
+            .await
+            .expect("Failed to build DrasiLib");
+
+        drasi.start().await.expect("Failed to start DrasiLib");
+
+        // Wait for source to reach Running
+        wait_for_running(&drasi, "concurrent-log-source").await;
+
+        let source_id = "concurrent-log-source";
+
+        // Subscribe to logs
+        let (_history, mut log_receiver) = drasi
+            .subscribe_source_logs(source_id)
+            .await
+            .expect("Failed to subscribe to source logs");
+
+        // Spawn multiple tasks that log concurrently
+        let log_counter = Arc::new(AtomicUsize::new(0));
+        let tasks_count = 10;
+        let logs_per_task = 50;
+
+        let mut handles = Vec::new();
+        for task_id in 0..tasks_count {
+            let instance_id = instance_id.to_string();
+            let counter = log_counter.clone();
+
+            handles.push(tokio::spawn(
+                async move {
+                    let span = tracing::info_span!(
+                        "concurrent_task",
+                        instance_id = %instance_id,
+                        component_id = "concurrent-log-source",
+                        component_type = "source"
+                    );
+
+                    async move {
+                        for i in 0..logs_per_task {
+                            tracing::info!("Task {} log {}", task_id, i);
+                            counter.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    .instrument(span)
+                    .await;
+                }
+                .with_current_subscriber(),
+            ));
+        }
+
+        // Wait for all tasks to complete
+        for handle in handles {
+            handle.await.expect("Task panicked");
+        }
+
+        let total_logged = log_counter.load(Ordering::SeqCst);
+        println!("Total logs emitted: {total_logged}");
+
+        // Collect logs
+        let received = timeout(Duration::from_secs(3), async {
+            let mut logs = Vec::new();
+            let mut lagged_count = 0u64;
+            loop {
+                match tokio::time::timeout(Duration::from_millis(200), log_receiver.recv()).await {
+                    Ok(Ok(log)) => logs.push(log),
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                        lagged_count += n;
+                        continue;
+                    }
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                    Err(_timeout) => break,
+                }
+            }
+            println!("Lagged (missed) messages: {lagged_count}");
+            logs
+        })
+        .await
+        .expect("Timeout collecting logs");
+
+        println!(
+            "Received {} logs out of {} emitted",
+            received.len(),
+            total_logged
+        );
+
+        // We should receive at least some logs
+        // (Many may be missed due to lag or channel capacity)
+        // Note: This test verifies the system doesn't crash under concurrent load,
+        // not that all logs are received
+        assert!(
+            !received.is_empty() || total_logged == 0,
+            "Expected at least some concurrent logs, got 0"
+        );
+
+        // Verify all received logs have correct component info
+        for log in &received {
+            assert_eq!(log.component_id, source_id);
+        }
+
+        drasi.shutdown().await.unwrap();
+    })
+    .await;
+}
+
+/// Test that multiple DrasiLib instances can log independently.
+#[tokio::test]
+async fn test_multiple_drasi_instances_logging() {
+    with_component_logs(async {
+        // Create two DrasiLib instances with different IDs
+        let source1 = SimpleLogSource::new("instance1-source").expect("Failed to create source1");
+        let source2 = SimpleLogSource::new("instance2-source").expect("Failed to create source2");
+
+        let drasi1 = DrasiLib::builder()
+            .with_id("drasi-instance-1")
+            .with_source(source1)
+            .build()
+            .await
+            .expect("Failed to build DrasiLib 1");
+
+        let drasi2 = DrasiLib::builder()
+            .with_id("drasi-instance-2")
+            .with_source(source2)
+            .build()
+            .await
+            .expect("Failed to build DrasiLib 2");
+
+        // Subscribe to logs from both instances
+        let (_h1, mut receiver1) = drasi1
+            .subscribe_source_logs("instance1-source")
+            .await
+            .expect("Failed to subscribe to instance1 logs");
+
+        let (_h2, mut receiver2) = drasi2
+            .subscribe_source_logs("instance2-source")
+            .await
+            .expect("Failed to subscribe to instance2 logs");
+
+        // Start both instances
+        drasi1.start().await.expect("Failed to start DrasiLib 1");
+        drasi2.start().await.expect("Failed to start DrasiLib 2");
+
+        // Collect logs from both
+        let logs1 = timeout(Duration::from_secs(2), async {
+            let mut logs = Vec::new();
+            while let Ok(log) = receiver1.recv().await {
+                logs.push(log);
+                if !logs.is_empty() {
+                    break;
+                }
+            }
+            logs
+        })
+        .await
+        .expect("Timeout waiting for instance1 logs");
+
+        let logs2 = timeout(Duration::from_secs(2), async {
+            let mut logs = Vec::new();
+            while let Ok(log) = receiver2.recv().await {
+                logs.push(log);
+                if !logs.is_empty() {
+                    break;
+                }
+            }
+            logs
+        })
+        .await
+        .expect("Timeout waiting for instance2 logs");
+
+        // Verify both instances received their logs
+        assert!(!logs1.is_empty(), "Instance 1 should have received logs");
+        assert!(!logs2.is_empty(), "Instance 2 should have received logs");
+
+        // Verify logs are correctly attributed
+        assert!(
+            logs1.iter().all(|l| l.component_id == "instance1-source"),
+            "Instance 1 logs should have correct component_id"
+        );
+        assert!(
+            logs2.iter().all(|l| l.component_id == "instance2-source"),
+            "Instance 2 logs should have correct component_id"
+        );
+
+        drasi1.shutdown().await.unwrap();
+        drasi2.shutdown().await.unwrap();
+    })
+    .await;
+}
+
+/// Test log worker handles rapid start/stop cycles.
+#[tokio::test]
+async fn test_rapid_start_stop_cycles() {
+    with_component_logs(async {
+        for i in 0..5 {
+            let source_id = format!("rapid-cycle-source-{i}");
+            let source = SimpleLogSource::new(&source_id).expect("Failed to create source");
+
+            let drasi = DrasiLib::builder()
+                .with_source(source)
+                .build()
+                .await
+                .expect("Failed to build DrasiLib");
+
+            // Subscribe
+            let (_history, mut receiver) = drasi
+                .subscribe_source_logs(&source_id)
+                .await
+                .expect("Failed to subscribe");
+
+            // Rapid start
+            drasi.start().await.expect("Failed to start");
+
+            // Try to get at least one log
+            let _ = timeout(Duration::from_millis(200), async {
+                let _ = receiver.recv().await;
+            })
+            .await;
+
+            // Rapid stop
+            drasi.shutdown().await.unwrap();
+        }
+
+        // If we got here without panicking, the test passes
+        // This verifies the log worker handles cleanup correctly
+    })
+    .await;
 }
 
 /// Test that log level filtering works through the channel.
 #[tokio::test]
 async fn test_log_level_filtering_through_channel() {
-    let source = SimpleLogSource::new("level-filter-source").expect("Failed to create source");
+    with_component_logs(async {
+        let source = SimpleLogSource::new("level-filter-source").expect("Failed to create source");
 
-    let drasi = DrasiLib::builder()
-        .with_source(source)
-        .build()
-        .await
-        .expect("Failed to build DrasiLib");
+        let drasi = DrasiLib::builder()
+            .with_source(source)
+            .build()
+            .await
+            .expect("Failed to build DrasiLib");
 
-    // Subscribe to logs before starting to detect log arrival
-    let (_, mut log_rx) = drasi
-        .subscribe_source_logs("level-filter-source")
-        .await
-        .expect("Failed to subscribe");
+        // Subscribe to logs before starting to detect log arrival
+        let (_, mut log_rx) = drasi
+            .subscribe_source_logs("level-filter-source")
+            .await
+            .expect("Failed to subscribe");
 
-    drasi.start().await.expect("Failed to start DrasiLib");
+        drasi.start().await.expect("Failed to start DrasiLib");
 
-    // Wait for at least one log to arrive (event-based instead of sleep)
-    let _ = timeout(Duration::from_secs(5), log_rx.recv())
-        .await
-        .expect("Timed out waiting for logs");
+        // Wait for at least one log to arrive (event-based instead of sleep)
+        let _ = timeout(Duration::from_secs(5), log_rx.recv())
+            .await
+            .expect("Timed out waiting for logs");
 
-    // Get log history
-    let (history, _) = drasi
-        .subscribe_source_logs("level-filter-source")
-        .await
-        .expect("Failed to subscribe");
+        // Get log history
+        let (history, _) = drasi
+            .subscribe_source_logs("level-filter-source")
+            .await
+            .expect("Failed to subscribe");
 
-    // By default (INFO level), we should have INFO logs
-    let has_info = history.iter().any(|l| l.level == LogLevel::Info);
-    assert!(has_info, "Expected INFO level logs");
+        // By default (INFO level), we should have INFO logs
+        let has_info = history.iter().any(|l| l.level == LogLevel::Info);
+        assert!(has_info, "Expected INFO level logs");
 
-    // Verify log messages are complete (not truncated)
-    for log in &history {
-        assert!(!log.message.is_empty(), "Log message should not be empty");
-    }
+        // Verify log messages are complete (not truncated)
+        for log in &history {
+            assert!(!log.message.is_empty(), "Log message should not be empty");
+        }
 
-    drasi.stop().await.ok();
+        drasi.shutdown().await.unwrap();
+    })
+    .await;
 }

@@ -281,10 +281,28 @@ impl DrasiLib {
         middleware_registry: Arc<MiddlewareTypeRegistry>,
         wal: Option<Arc<dyn crate::wal::WalProvider>>,
     ) -> Self {
-        let log_registry = crate::observability::get_or_init_global_registry();
+        Self::new_with_observability(
+            config,
+            middleware_registry,
+            wal,
+            crate::observability::TelemetrySettings::default(),
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_observability(
+        config: Arc<RuntimeConfig>,
+        middleware_registry: Arc<MiddlewareTypeRegistry>,
+        wal: Option<Arc<dyn crate::wal::WalProvider>>,
+        telemetry: crate::observability::TelemetrySettings,
+        log_registry: Option<Arc<ComponentLogRegistry>>,
+    ) -> Self {
+        let log_registry =
+            log_registry.unwrap_or_else(crate::observability::get_or_init_global_registry);
         let instance_id = config.id.clone();
         let instance_graph = Arc::new(crate::computation::instance::InstanceGraph::new(
             instance_id,
+            telemetry,
         ));
         let computation_runtime = crate::computation::runtime::Runtime::new(
             config.clone(),

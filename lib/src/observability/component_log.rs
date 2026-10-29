@@ -26,8 +26,8 @@
 //!
 //! # Usage
 //!
-//! Log capture is automatic when code runs within a tracing span that has
-//! `component_id` and `component_type` attributes:
+//! After the host installs `ComponentLogRuntime::layer()`, log capture uses
+//! tracing spans with `component_id` and `component_type` attributes:
 //!
 //! ```no_run
 //! use tracing::Instrument;

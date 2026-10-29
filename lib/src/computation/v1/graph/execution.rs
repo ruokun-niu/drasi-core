@@ -18,6 +18,7 @@ use futures::{
     FutureExt, StreamExt,
 };
 use tokio::{sync::RwLock, task::JoinHandle};
+use tracing::instrument::WithSubscriber;
 
 use super::controller::InstanceSlot;
 use super::{topology, GraphError, GraphResult};
@@ -318,7 +319,16 @@ impl<T: Send + 'static> Tasks<T> {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .insert(id, task.clone());
-        if let Err(error) = crate::context::workers::try_spawn_owned_worker(&task.join, work) {
+        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+        let spawned = if dispatcher.is::<tracing::subscriber::NoSubscriber>() {
+            crate::context::workers::try_spawn_owned_worker(&task.join, work)
+        } else {
+            crate::context::workers::try_spawn_owned_worker(
+                &task.join,
+                work.with_subscriber(dispatcher),
+            )
+        };
+        if let Err(error) = spawned {
             self.entries
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())

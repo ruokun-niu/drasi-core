@@ -121,6 +121,8 @@ use drasi_core::models::SourceMiddlewareConfig;
 /// # }
 /// ```
 pub struct DrasiLibBuilder {
+    telemetry: crate::observability::TelemetrySettings,
+    log_registry: Option<Arc<crate::observability::ComponentLogRegistry>>,
     management: Option<crate::management::ManagementOptions>,
     server_id: Option<String>,
     priority_queue_capacity: Option<usize>,
@@ -159,6 +161,21 @@ impl Default for DrasiLibBuilder {
 }
 
 impl DrasiLibBuilder {
+    /// Configure collection without installing a subscriber or recorder.
+    pub fn with_telemetry(mut self, settings: crate::observability::TelemetrySettings) -> Self {
+        self.telemetry = settings;
+        self
+    }
+
+    /// Use the registry belonging to the host's component-log runtime.
+    pub fn with_log_registry(
+        mut self,
+        registry: Arc<crate::observability::ComponentLogRegistry>,
+    ) -> Self {
+        self.log_registry = Some(registry);
+        self
+    }
+
     pub fn with_management(mut self, options: crate::management::ManagementOptions) -> Self {
         self.management = Some(options);
         self
@@ -201,6 +218,8 @@ impl DrasiLibBuilder {
     /// Create a new builder with default values.
     pub fn new() -> Self {
         Self {
+            telemetry: crate::observability::TelemetrySettings::default(),
+            log_registry: None,
             management: None,
             server_id: None,
             priority_queue_capacity: None,
@@ -615,6 +634,9 @@ impl DrasiLibBuilder {
     }
 
     async fn build_inner(self) -> Result<DrasiLib> {
+        self.telemetry.validate().map_err(|error| {
+            DrasiError::invalid_config("invalid telemetry settings").with_cause(error)
+        })?;
         // Build the configuration
         let config = DrasiLibConfig {
             id: self.server_id.unwrap_or_else(|| "drasi-lib".to_string()),
@@ -691,6 +713,8 @@ impl DrasiLibBuilder {
             self.reaction_instances,
             self.bootstrap_metadata,
             self.wal_provider,
+            self.telemetry,
+            self.log_registry,
         )
         .await
     }

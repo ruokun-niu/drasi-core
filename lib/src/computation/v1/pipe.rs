@@ -119,6 +119,7 @@ pub trait Acknowledgement: Send + Sync {
 pub struct Delivery {
     envelope: ChangeEnvelope,
     acknowledgement: Option<Box<dyn Acknowledgement>>,
+    execution: crate::observability::ExecutionContext,
 }
 
 impl Delivery {
@@ -129,11 +130,35 @@ impl Delivery {
         Self {
             envelope,
             acknowledgement,
+            execution: crate::observability::ExecutionContext::default(),
         }
     }
 
     pub fn envelope(&self) -> &ChangeEnvelope {
         &self.envelope
+    }
+
+    /// Attach local-only metadata without changing the envelope or its digest.
+    pub fn with_execution_context(
+        mut self,
+        context: crate::observability::ExecutionContext,
+    ) -> Self {
+        self.execution = context;
+        self
+    }
+
+    pub fn execution_context(&self) -> &crate::observability::ExecutionContext {
+        &self.execution
+    }
+
+    pub fn into_execution_parts(
+        self,
+    ) -> (
+        ChangeEnvelope,
+        Option<Box<dyn Acknowledgement>>,
+        crate::observability::ExecutionContext,
+    ) {
+        (self.envelope, self.acknowledgement, self.execution)
     }
 
     /// The host retains the handle separately while invoking a sink/transformer;
@@ -147,6 +172,27 @@ impl Delivery {
 /// A host serializes sends for a single producer stream in sequence order.
 #[async_trait]
 pub trait EnvelopeSender: Send + Sync {
+    /// Whether this provider preserves transient context independently of event bytes.
+    fn supports_execution_context(&self) -> bool {
+        false
+    }
+
+    async fn send_with_context(
+        &self,
+        envelope: ChangeEnvelope,
+        context: crate::observability::ExecutionContext,
+    ) -> std::result::Result<EnqueueReceipt, SendFailure> {
+        if context.trace.is_some() {
+            return Err(SendFailure {
+                envelope,
+                error: PipeError::Backend(anyhow::anyhow!(
+                    "this pipe does not support transient execution context"
+                )),
+            });
+        }
+        self.send(envelope).await
+    }
+
     /// Sequential batch acceptance. On error, accepted receipts and the exact
     /// failed/not-attempted envelopes are retained; no batch atomicity is implied.
     async fn send_batch(

@@ -64,8 +64,16 @@ pub(crate) async fn build(
     reactions: Vec<ReactionRegistration>,
     bootstraps: Vec<BootstrapRegistration>,
     wal: Option<Arc<dyn crate::wal::WalProvider>>,
+    telemetry: crate::observability::TelemetrySettings,
+    log_registry: Option<Arc<crate::observability::ComponentLogRegistry>>,
 ) -> crate::Result<DrasiLib> {
-    let mut core = DrasiLib::new_with_wal(config.clone(), wal);
+    let mut core = DrasiLib::new_with_observability(
+        config.clone(),
+        DrasiLib::default_middleware_registry(),
+        wal,
+        telemetry,
+        log_registry,
+    );
     let setup = async {
         let mut recipes = BTreeMap::new();
         for (source, kind, properties) in bootstraps {

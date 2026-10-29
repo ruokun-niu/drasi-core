@@ -257,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
 - [Storage Backends](#storage-backends)
 - [State Store Providers](#state-store-providers)
 - [Logging](#logging)
+- [Computation Graph Observability](#computation-graph-observability)
 - [Middleware](#middleware)
 - [Plugin Architecture](#plugin-architecture)
 - [YAML Configuration](#yaml-configuration)
@@ -732,7 +733,39 @@ async fn start(&self) -> Result<()> {
 
 ## Logging
 
-DrasiLib provides component-aware logging built on [tracing](https://docs.rs/tracing/). Logging is **initialized automatically** when you call `build()` — no manual setup required.
+DrasiLib provides component-aware logging built on [tracing](https://docs.rs/tracing/).
+The embedding application owns initialization and shutdown. Constructing a library
+instance or graph installs no subscriber, logger, or metrics recorder.
+
+For explicit convenience setup:
+
+```rust
+use drasi_lib::{observability::init_default_subscriber, DrasiLib};
+use std::time::Duration;
+
+let logging = init_default_subscriber().await?;
+let core = DrasiLib::builder().build().await?;
+// Start components and run the application.
+core.shutdown().await?;
+logging.shutdown(Duration::from_secs(5)).await?;
+```
+
+For an existing subscriber, call `observability::init_component_logging().await?`
+and compose `logging.layer()` with the application's other layers. This does not
+install any globals or a `log` bridge; the host installs its bridge explicitly.
+`ComponentLogRuntime::new(registry, capacity)` supports an isolated registry; pass
+the same registry to `DrasiLib::builder().with_log_registry(registry)`.
+
+The bounded worker belongs to the caller's Tokio runtime and works on both
+runtime flavors. Stop producers before draining it. Shutdown timeout/cancellation
+retains worker ownership for a subsequent shutdown attempt. `logging.loss()`
+reports full/closed-queue losses independently of tracing or metric export.
+
+**Initialization migration:** `get_or_init_global_registry()` now only returns
+the registry. It no longer installs a subscriber or starts a detached thread.
+Replace direct `ComponentLogLayer::new(...)` construction with `logging.layer()`.
+Explicit convenience initialization reports subscriber/logger conflicts rather
+than silently ignoring them.
 
 Control verbosity with `RUST_LOG`:
 
@@ -771,7 +804,85 @@ pub struct LogMessage {
 }
 ```
 
-Standard `log::info!()` and `tracing::info!()` macros both work inside plugin code — logs are automatically routed to the component that spawned the task.
+With host logging configured, standard `log::info!()` and `tracing::info!()` macros
+work inside component scopes. Hosts using a scoped subscriber must propagate
+that dispatcher into application-owned spawned tasks; graph-owned tasks preserve
+the host dispatcher. Component-specific workers remain responsible for their own
+context propagation.
+
+## Computation Graph Observability
+
+The `observability-playground` branch implements an experimental, in-process
+slice of [drasi-project/design-documents#25](https://github.com/drasi-project/design-documents/pull/25).
+It is not the completed plugin/server observability implementation.
+
+`observability::TelemetryProfile::{Off, Basic, Debug}.resolve()` produces
+collection settings for `DrasiLibBuilder::with_telemetry(...)` or
+`ComputationGraph::builder(...).with_telemetry(...)`. Collection is off by default.
+Settings belong to the owning graph, not to a reusable component batch.
+
+- Metrics-only collection uses `TelemetryProfile::Basic.resolve().without_traces()`.
+  Install the host's `metrics` recorder before constructing components.
+- Connected tracing also requires a host `TraceContextAdapter`. Missing adapters
+  are configuration errors. The host chooses sampling, filtering and export;
+  unsampled trace identity still propagates, and enabled metrics are unsampled.
+  Keep a clone of the settings to inspect `context_failures()` without relying
+  on metric export. Adapter failures are diagnosed without failing business work.
+- Basic spans cover polled source publication, transformer/query processing,
+  single-input sink handling, and actual start/stop/reconfigure calls.
+  Debug adds pipe-send spans, including capacity waiting.
+- Generic component counters/durations and source dispatch counts are emitted at
+  operation boundaries. Bounded-pipe queue gauges, blocking and drop counts use
+  the provider's authoritative updates. Existing inspection snapshots are retained.
+- IDs are attributes/labels, not span or metric names. Generation is trace-only.
+  Durations use monotonic clocks; sink acceptance is not reported as handling.
+
+Portable `ExecutionContext` accompanies bounded and byte-bounded pipe deliveries,
+separately from encoded envelopes, annotations and receipt identity. The current
+source path begins a trace at graph publication. It does not yet accept incoming
+protocol context through source/plugin APIs.
+
+Connected tracing currently requires context-capable in-process pipes and a
+non-batching sink. Unsupported pipes/batching fail explicitly rather than
+silently discarding context. Admission/QoS, scheduled evaluation, bootstrap,
+plugin internals/FFI, control-request spans, evaluator/commit detail and
+end-to-end duration instruments remain follow-up work. The persistence profile
+is rejected until its observations are implemented.
+
+### Runnable Experiment
+
+The existing [computation runtime example](examples/computation_runtime.rs) keeps
+its original no-argument behavior. Its opt-in experiment uses one native
+application source, one query, capacity-one graph pipes, and a callback sink:
+
+```bash
+cargo run -p drasi-lib --example computation_runtime
+cargo run -p drasi-lib --example computation_runtime -- --observability off
+cargo run -p drasi-lib --example computation_runtime -- --observability basic
+cargo run -p drasi-lib --example computation_runtime -- --observability debug --slow-sink-ms 25
+```
+
+The experiment sends five deterministic source changes, including an update,
+a delete, and a filtered-out insert. It validates four result envelopes and a
+single final row. OpenTelemetry spans export through a host-owned batch worker
+to stdout; a debugging recorder prints final metric observations. This recorder
+is for experiments, not production metrics retention. Exporter/SDK dependencies
+are development-only, not dependencies of the runtime or evaluator.
+
+For a local trace timeline in Jaeger, run:
+
+```bash
+bash lib/examples/observability-demo/demo.sh run
+```
+
+This starts a dedicated local Jaeger container, exports fast and slow-sink
+workloads over OTLP/HTTP, verifies the received traces, and prints browser links.
+See the [five-minute demo guide](examples/observability-demo/README.md) for
+prerequisites, the walkthrough, manual exporter options and cleanup.
+The default stdout export remains unchanged when `--otlp-endpoint` is omitted.
+
+See the [implementation plan](../OBSERVABILITY_PLAYGROUND_PLAN.md) for milestones
+and deferred scope.
 
 ---
 

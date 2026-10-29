@@ -3864,26 +3864,29 @@ async fn declared_references_validate_roles_on_the_committed_node() {
 
 #[tokio::test]
 async fn native_service_logs_use_the_ordinary_instance_and_component_keys() {
-    let (source, _) = ControlledSource::new("source");
-    let core = builder()
-        .with_id("native-log-parity")
-        .with_source(source)
-        .build()
-        .await
-        .unwrap();
-    let (_, mut logs) = core.subscribe_source_logs("source").await.unwrap();
-    core.start_source("source").await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let message = logs.recv().await.unwrap();
-            if message.message.contains("controlled-source-start") {
-                break;
+    crate::test_helpers::with_component_logs(async {
+        let (source, _) = ControlledSource::new("source");
+        let core = builder()
+            .with_id("native-log-parity")
+            .with_source(source)
+            .build()
+            .await
+            .unwrap();
+        let (_, mut logs) = core.subscribe_source_logs("source").await.unwrap();
+        core.start_source("source").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let message = logs.recv().await.unwrap();
+                if message.message.contains("controlled-source-start") {
+                    break;
+                }
             }
-        }
+        })
+        .await
+        .expect("native source logs must use the normal source log subscription");
+        core.shutdown().await.unwrap();
     })
-    .await
-    .expect("native source logs must use the normal source log subscription");
-    core.shutdown().await.unwrap();
+    .await;
 }
 
 struct DeferredPersistentProvider;

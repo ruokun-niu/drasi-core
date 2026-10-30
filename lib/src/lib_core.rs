@@ -382,6 +382,11 @@ impl DrasiLib {
     /// * The server is already running (`DrasiError::InvalidState`)
     /// * Any component fails to start (propagated from component)
     ///
+    /// A component failure returns a [`crate::error::PartialStartError`] cause.
+    /// Independent components may already be running: `is_running()` stays true
+    /// and `stop()`/`shutdown()` remain available. Stop before retrying `start()`.
+    /// Valid declarations waiting for missing dependencies are not startup errors.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -400,11 +405,29 @@ impl DrasiLib {
     /// # }
     /// ```
     pub async fn start(&self) -> crate::error::Result<()> {
-        let mut lifecycle = self.instance_graph.lifecycle.lock().await;
+        let mut cancellation = self.instance_graph.startup_cancellation();
+        let deadline = self.lifecycle_deadline(
+            "startup",
+            self.config.startup_timeout_secs,
+            crate::computation::v1::DEFAULT_STARTUP_TIMEOUT,
+        )?;
+        let lifecycle = deadline
+            .wait(
+                "waiting for lifecycle access",
+                false,
+                self.instance_graph.lifecycle.clone().lock_owned(),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
         // Reject start after permanent shutdown
         if self.is_shutdown.load(std::sync::atomic::Ordering::Acquire) {
             return Err(DrasiError::invalid_state(
                 "Server has been shut down and cannot be restarted",
+            ));
+        }
+        if lifecycle.stop_incomplete {
+            return Err(DrasiError::invalid_state(
+                "Previous stop requires cleanup; retry stop or shutdown before starting",
             ));
         }
 
@@ -423,17 +446,100 @@ impl DrasiLib {
             ));
         }
 
+        deadline
+            .wait(
+                "joining prior startup",
+                false,
+                self.instance_graph.join_startup(),
+            )
+            .await
+            .map_err(anyhow::Error::from)??;
+        *self.running.write().await = true;
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let core = self.clone();
+        let work_deadline = deadline.clone();
+        let work_cancellation = cancellation.clone();
+        self.instance_graph.spawn_startup(tracing::Instrument::in_current_span(async move {
+            let owner = core.config.id.clone();
+            let work = async move {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(DrasiError::Internal(
+                        crate::error::PartialStartError { cause: cancellation.error() }.into(),
+                    )),
+                    result = core.start_accepted(lifecycle, work_deadline, work_cancellation) => result,
+                }
+            };
+            let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(work))
+                .await.unwrap_or_else(|payload| Err(DrasiError::Internal(
+                    crate::error::PartialStartError {
+                        cause: crate::computation::v1::GraphError::Driver {
+                            graph: Arc::from(owner),
+                            run_epoch: 0,
+                            source: crate::computation::v1::ComponentPanic::new(anyhow::anyhow!(
+                                "startup: {}",
+                                crate::computation::v1::bounded_panic_message(payload),
+                            )).into(),
+                        }.into(),
+                    }.into(),
+                )));
+            if let Err(Err(error)) = reply.send(result) {
+                warn!("Owned instance startup failed after its caller stopped waiting: {error:#}");
+            }
+        }))?;
+        deadline
+            .wait("observing instance startup", true, result)
+            .await
+            .map_err(|cause| {
+                DrasiError::Internal(
+                    crate::error::PartialStartError {
+                        cause: cause.into(),
+                    }
+                    .into(),
+                )
+            })?
+            .map_err(anyhow::Error::from)?
+    }
+
+    async fn start_accepted(
+        &self,
+        mut lifecycle: tokio::sync::OwnedMutexGuard<
+            crate::computation::instance::InstanceLifecycle,
+        >,
+        deadline: crate::computation::v1::OperationDeadline,
+        cancellation: crate::computation::instance::StartupCancellation,
+    ) -> crate::error::Result<()> {
         info!("Starting drasi-lib");
 
         // Start all configured components (no lock held during this await)
-        self.start_parallel_components().await?;
+        deadline
+            .wait(
+                "starting components",
+                true,
+                self.start_parallel_components(),
+            )
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
+            .map_err(|cause| {
+                DrasiError::Internal(crate::error::PartialStartError { cause }.into())
+            })?;
 
-        // Brief write lock to set the flag
-        *self.running.write().await = true;
         lifecycle.stop_incomplete = false;
         drop(lifecycle);
         if let Some(management) = self.management.get() {
-            let report = management.reconcile().await?;
+            let report = deadline
+                .wait(
+                    "reconciling managed components",
+                    true,
+                    management.reconcile_for_startup(cancellation),
+                )
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+                .map_err(|cause| {
+                    DrasiError::Internal(crate::error::PartialStartError { cause }.into())
+                })?;
             let observed = self.computation_control()?.observed();
             if !report.converged()
                 && (report.error.is_some()
@@ -446,9 +552,11 @@ impl DrasiLib {
                         .values()
                         .any(|resource| resource.failure.is_some()))
             {
-                return Err(DrasiError::invalid_state(
-                    "managed components did not all become ready; inspect management status",
-                ));
+                return Err(DrasiError::Internal(crate::error::PartialStartError {
+                    cause: DrasiError::invalid_state(
+                        "managed components did not all become ready; inspect management status",
+                    ).into(),
+                }.into()));
             }
         }
         info!("drasi-lib started successfully");
@@ -470,6 +578,8 @@ impl DrasiLib {
     /// * Any component fails to stop. Every other component is still stopped and
     ///   the server reports itself stopped, but `stop()` may be called again to
     ///   retry the components that did not stop.
+    /// * The overall deadline expires. Unfinished work and the running flag
+    ///   remain owned; retry `stop()` or `shutdown()` before restarting.
     ///
     /// # Examples
     ///
@@ -489,13 +599,35 @@ impl DrasiLib {
     /// # }
     /// ```
     pub async fn stop(&self) -> crate::error::Result<()> {
-        let mut lifecycle = self.instance_graph.lifecycle.lock().await;
-        self.stop_unlocked(&mut lifecycle).await
+        let deadline = self.lifecycle_deadline(
+            "stop",
+            self.config.shutdown_timeout_secs,
+            crate::computation::v1::DEFAULT_SHUTDOWN_TIMEOUT,
+        )?;
+        self.instance_graph.interrupt_startup();
+        let mut lifecycle = deadline
+            .wait(
+                "waiting for lifecycle access",
+                false,
+                self.instance_graph.lifecycle.lock(),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        deadline
+            .wait(
+                "joining interrupted startup",
+                true,
+                self.instance_graph.join_startup(),
+            )
+            .await
+            .map_err(anyhow::Error::from)??;
+        self.stop_unlocked(&mut lifecycle, &deadline).await
     }
 
     async fn stop_unlocked(
         &self,
         lifecycle: &mut crate::computation::instance::InstanceLifecycle,
+        deadline: &crate::computation::v1::OperationDeadline,
     ) -> crate::error::Result<()> {
         // Check precondition under a brief read lock, then release before heavy work.
         {
@@ -509,10 +641,16 @@ impl DrasiLib {
         info!("Stopping drasi-lib");
 
         // Stop all components (no lock held during this await).
-        // Capture the result but always mark as stopped — partial shutdown is
-        // preferable to leaving the running flag set after a partial failure.
-        // A failure is remembered instead, so that stop() can be retried.
-        let result = self.computation_runtime.stop_all().await;
+        // A cancelled or timed-out wait must still require cleanup on retry.
+        lifecycle.stop_incomplete = true;
+        let result = deadline
+            .wait(
+                "stopping components",
+                true,
+                self.computation_runtime.stop_all(),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
 
         // Brief write lock to clear the flag
         *self.running.write().await = false;
@@ -560,23 +698,92 @@ impl DrasiLib {
     /// # }
     /// ```
     pub async fn shutdown(&self) -> crate::error::Result<()> {
+        let deadline = self.lifecycle_deadline(
+            "shutdown",
+            self.config.shutdown_timeout_secs,
+            crate::computation::v1::DEFAULT_SHUTDOWN_TIMEOUT,
+        )?;
         self.is_shutdown
             .store(true, std::sync::atomic::Ordering::Release);
         self.instance_graph.request_shutdown();
-        let _lifecycle = self.instance_graph.lifecycle.lock().await;
+        let _lifecycle = deadline
+            .wait(
+                "waiting for lifecycle access",
+                true,
+                self.instance_graph.lifecycle.lock(),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
 
-        let computation_shutdown = self.instance_graph.shutdown().await;
-        let runtime_shutdown = self.computation_runtime.shutdown().await;
+        let mut failures = Vec::new();
+        let computation_shutdown = deadline
+            .wait(
+                "joining graph cleanup",
+                true,
+                self.instance_graph.shutdown(),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        if let Err(error) = computation_shutdown {
+            failures.push(error.context("shutting down computation graph"));
+        }
+        let runtime_shutdown = match deadline
+            .wait(
+                "cleaning up instance adapters",
+                true,
+                self.computation_runtime.shutdown(),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                failures.push(error.into());
+                return Err(DrasiError::Internal(
+                    crate::error::OperationFailures::new("instance shutdown incomplete", failures)
+                        .into(),
+                ));
+            }
+        };
         *self.running.write().await = false;
-        runtime_shutdown?;
-        computation_shutdown?;
+        if let Err(error) = runtime_shutdown {
+            failures.push(error.context("shutting down instance adapters"));
+        }
         drop(_lifecycle);
-        if let Some(management) = self.management.get() {
-            management.close().await?;
+        // Store ownership must outlive every unfinished processing owner.
+        if failures.is_empty() {
+            if let Some(management) = self.management.get() {
+                if let Err(error) = deadline
+                    .wait("closing configuration storage", true, management.close())
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result)
+                {
+                    failures.push(error.context("closing configuration store"));
+                }
+            }
+        }
+        if !failures.is_empty() {
+            return Err(DrasiError::Internal(
+                crate::error::OperationFailures::new("instance shutdown failed", failures).into(),
+            ));
         }
 
         info!("drasi-lib shut down permanently");
         Ok(())
+    }
+
+    fn lifecycle_deadline(
+        &self,
+        operation: &'static str,
+        seconds: Option<u64>,
+        default: std::time::Duration,
+    ) -> crate::error::Result<crate::computation::v1::OperationDeadline> {
+        Ok(crate::computation::v1::OperationDeadline::new(
+            self.config.id.as_str(),
+            operation,
+            std::time::Duration::from_secs(seconds.unwrap_or(default.as_secs())),
+        )
+        .map_err(anyhow::Error::from)?)
     }
 
     // ============================================================================
@@ -646,7 +853,7 @@ impl DrasiLib {
     /// Get a read-only facade for graph snapshots and component event history.
     /// Lifecycle and membership changes must go through the computation controller.
     pub fn component_graph(&self) -> ComponentGraphView {
-        ComponentGraphView::from_runtime(&self.computation_runtime)
+        ComponentGraphView::from_runtime(&self.computation_runtime, &self.running)
     }
 
     // ============================================================================

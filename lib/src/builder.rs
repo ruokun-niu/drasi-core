@@ -127,8 +127,16 @@ pub struct DrasiLibBuilder {
     server_id: Option<String>,
     priority_queue_capacity: Option<usize>,
     dispatch_buffer_capacity: Option<usize>,
+    activation_timeout_secs: Option<u64>,
+    startup_timeout_secs: Option<u64>,
+    shutdown_timeout_secs: Option<u64>,
+    construction_timeout_secs: Option<u64>,
+    resource_construction_timeout_secs: Option<u64>,
+    cleanup_timeout_secs: Option<u64>,
     storage_backends: Vec<StorageBackendConfig>,
     query_configs: Vec<QueryConfig>,
+    #[cfg(feature = "test-support")]
+    query_test_controls: Vec<(String, crate::test_support::QueryTestControl)>,
     source_instances: Vec<(
         Box<dyn SourceTrait>,
         std::collections::HashMap<String, String>,
@@ -224,8 +232,16 @@ impl DrasiLibBuilder {
             server_id: None,
             priority_queue_capacity: None,
             dispatch_buffer_capacity: None,
+            activation_timeout_secs: None,
+            startup_timeout_secs: None,
+            shutdown_timeout_secs: None,
+            construction_timeout_secs: None,
+            resource_construction_timeout_secs: None,
+            cleanup_timeout_secs: None,
             storage_backends: Vec::new(),
             query_configs: Vec::new(),
+            #[cfg(feature = "test-support")]
+            query_test_controls: Vec::new(),
             source_instances: Vec::new(),
             reaction_instances: Vec::new(),
             bootstrap_metadata: Vec::new(),
@@ -466,6 +482,43 @@ impl DrasiLibBuilder {
         self
     }
 
+    /// Bound each component's activation, including input/start/output binding.
+    /// Defaults to 300 seconds; zero or an unrepresentable deadline fails build.
+    pub fn with_activation_timeout_secs(mut self, seconds: u64) -> Self {
+        self.activation_timeout_secs = Some(seconds);
+        self
+    }
+
+    /// Bound the whole instance startup operation. Defaults to 600 seconds.
+    pub fn with_startup_timeout_secs(mut self, seconds: u64) -> Self {
+        self.startup_timeout_secs = Some(seconds);
+        self
+    }
+
+    /// Bound stop and shutdown waits without abandoning unfinished work. Defaults to 60 seconds.
+    pub fn with_shutdown_timeout_secs(mut self, seconds: u64) -> Self {
+        self.shutdown_timeout_secs = Some(seconds);
+        self
+    }
+
+    /// Bound each component construction/configuration callback. Defaults to five seconds.
+    pub fn with_construction_timeout_secs(mut self, seconds: u64) -> Self {
+        self.construction_timeout_secs = Some(seconds);
+        self
+    }
+
+    /// Bound each resource constructor. Defaults to thirty seconds.
+    pub fn with_resource_construction_timeout_secs(mut self, seconds: u64) -> Self {
+        self.resource_construction_timeout_secs = Some(seconds);
+        self
+    }
+
+    /// Bound each owner's cleanup separately from the total shutdown budget. Defaults to five seconds.
+    pub fn with_cleanup_timeout_secs(mut self, seconds: u64) -> Self {
+        self.cleanup_timeout_secs = Some(seconds);
+        self
+    }
+
     /// Add a source instance, taking ownership.
     ///
     /// Source instances are created externally by plugins with their own typed configurations.
@@ -581,6 +634,20 @@ impl DrasiLibBuilder {
         self
     }
 
+    /// Attach a deterministic physical clock and output frontier to a builder query.
+    ///
+    /// Requires `test-support`. Controls do not change query identities, source
+    /// timestamps, logical evaluation clocks or queries without a control.
+    #[cfg(feature = "test-support")]
+    pub fn with_query_test_control(
+        mut self,
+        query_id: impl Into<String>,
+        control: crate::test_support::QueryTestControl,
+    ) -> Self {
+        self.query_test_controls.push((query_id.into(), control));
+        self
+    }
+
     /// Build the DrasiLib instance.
     ///
     /// This validates the configuration, creates all components, and initializes the server.
@@ -637,11 +704,37 @@ impl DrasiLibBuilder {
         self.telemetry.validate().map_err(|error| {
             DrasiError::invalid_config("invalid telemetry settings").with_cause(error)
         })?;
+        #[cfg(feature = "test-support")]
+        let test_controls = {
+            let mut controls = std::collections::BTreeMap::new();
+            for (id, control) in self.query_test_controls {
+                if !self.query_configs.iter().any(|query| query.id == id) {
+                    return Err(DrasiError::invalid_config(format!(
+                        "test control references unknown builder query '{id}'"
+                    )));
+                }
+                if controls.insert(id.clone(), control).is_some() {
+                    return Err(DrasiError::invalid_config(format!(
+                        "duplicate test control for query '{id}'"
+                    )));
+                }
+            }
+            for control in controls.values() {
+                control.bind()?;
+            }
+            controls
+        };
         // Build the configuration
         let config = DrasiLibConfig {
             id: self.server_id.unwrap_or_else(|| "drasi-lib".to_string()),
             priority_queue_capacity: self.priority_queue_capacity,
             dispatch_buffer_capacity: self.dispatch_buffer_capacity,
+            activation_timeout_secs: self.activation_timeout_secs,
+            startup_timeout_secs: self.startup_timeout_secs,
+            shutdown_timeout_secs: self.shutdown_timeout_secs,
+            construction_timeout_secs: self.construction_timeout_secs,
+            resource_construction_timeout_secs: self.resource_construction_timeout_secs,
+            cleanup_timeout_secs: self.cleanup_timeout_secs,
             storage_backends: self.storage_backends,
             queries: self.query_configs.clone(),
         };
@@ -715,6 +808,8 @@ impl DrasiLibBuilder {
             self.wal_provider,
             self.telemetry,
             self.log_registry,
+            #[cfg(feature = "test-support")]
+            test_controls,
         )
         .await
     }

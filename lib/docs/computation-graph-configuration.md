@@ -50,6 +50,12 @@ Server YAML.
 | `with_priority_queue_capacity(n)` | 10,000 when no override is set | Default query input-queue capacity |
 | `with_dispatch_buffer_capacity(n)` | 1,000 when no override is set | Default runtime dispatch-buffer capacity |
 | `with_default_recovery_policy(policy)` | `RecoveryPolicy::Strict` | Query recovery default when the query has no override |
+| `with_activation_timeout_secs(seconds)` | 300 | Positive per-component deadline covering input binding, startup and output binding |
+| `with_startup_timeout_secs(seconds)` | 600 | Overall `start()` budget, including lifecycle-lock admission and managed reconciliation |
+| `with_shutdown_timeout_secs(seconds)` | 60 | Overall `stop()` / `shutdown()` budget, including lock admission and cleanup phases |
+| `with_construction_timeout_secs(seconds)` | 5 | One budget for configuration resolution and component construction/reconfiguration |
+| `with_resource_construction_timeout_secs(seconds)` | 30 | Per-resource construction budget |
+| `with_cleanup_timeout_secs(seconds)` | 5 | Individual owner cleanup budget, independent of the overall shutdown budget |
 | `with_index_provider(name, provider)` | None registered by this call | Register an existing index provider under a name |
 | `with_default_index_provider(name, provider)` | In-memory indexes otherwise | Register the provider and make it the default for queries |
 | `with_state_store_provider(provider)` | In-memory state store | Storage for component state, including supported reaction checkpoints |
@@ -246,6 +252,11 @@ stale; choose AutoReset with a snapshot-capable reaction when it must be replace
 
 Do not treat restart as a way to reuse unrelated state under the same ID.
 Query reset/recreation identity and configuration checks protect against that.
+AutoReset does not erase output with a valid foreign producer identity; that
+ownership mismatch is an error under every policy. A replacement snapshot after
+completed durable bootstrap requires explicit reset authorization: Strict rejects
+it, while AutoReset starts a new output generation before replacing state.
+The snapshot cannot silently change rows at an unchanged output identity/cursor.
 
 ## Startup, shutdown and worker count
 
@@ -253,10 +264,76 @@ Query reset/recreation identity and configuration checks protect against that.
 reached when an add call returns. Use a component handle and a caller deadline
 when readiness matters.
 
+`DrasiLib::start()` returns a typed `PartialStartError` cause for failed requested
+startup, including ordinary queries. Already started components remain owned and
+`is_running()` remains true so that inspection and cleanup are available. Call
+`stop()` or `shutdown()` before retrying startup. Missing dependencies remain
+visible waits, not errors. Ordinary additions serialize with instance startup
+and stop, so their auto-start decision uses the completed lifecycle boundary.
+Quiescing and quiesced components appear as `Reconfiguring`, not `Running`.
+An initialized query can still serve generation-fenced snapshot/history reads
+while quiesced; that read capability does not mean it is processing new inputs.
+
 `bootstrapTimeoutSecs` is a snapshot/history readiness timeout, not a universal
-startup or shutdown timeout. A directly built graph has a separate
-`ComputationGraphBuilder::cleanup_timeout(Duration)` setting, defaulting to
-5 seconds.
+startup or shutdown timeout. Each component's input binding, start hook and
+output binding are bounded by graph activation, defaulting to 300 seconds.
+Direct graph builders can set `activation_timeout(Duration)`. Configuration
+resolution and construction share `construction_timeout(Duration)`, defaulting
+to 5 seconds. Resource creation uses `resource_construction_timeout(Duration)`,
+defaulting to 30 seconds. `cleanup_timeout(Duration)` defaults to 5 seconds per
+owner, separately from the overall shutdown budget. Interrupted activation
+retains cleanup ownership rather than allowing immediate reuse of damaged state.
+Component batches carry definitions and bindings, not a separate execution
+policy; they use the owning instance's deadlines.
+For DrasiLib, use `with_activation_timeout_secs`; its configuration snapshot
+retains `activation_timeout_secs`. Server exposes the same setting as
+`instances[].activationTimeoutSecs`, including environment references, and on
+instance creation. Set it high enough for the intended full bootstrap workload;
+changing a YAML instance setting takes effect when that instance is reconstructed.
+
+Instance `start()` has a 600-second overall budget; `stop()` and `shutdown()` have
+a 60-second overall budget. Each budget starts before lifecycle-lock admission
+and is shared across subsequent phases, not restarted at every await. Native
+start/stop/quiesce/force-cancellation requests and deployment/startup report waits
+also have finite budgets. Direct graph `shutdown()` and `dispose()` retain
+unfinished resources when their overall budget expires.
+
+Timeouts retain a typed `GraphError::LifecycleTimeout` cause with the instance
+or graph identity, operation, expired phase, configured budget and whether work
+was accepted. Acceptance is not completion: inspect the current observations,
+then retry cleanup. An accepted start may finish after its caller times out.
+Timed-out or cancelled stops block restart until cleanup is retried. Permanent
+shutdown remains permanent even when its first cleanup attempt times out, and
+configuration storage is not closed underneath unfinished processing. Dropped
+management cleanup retains its owner and logs failed attempts with exponential
+retry delays from 1 to 30 seconds.
+
+Stop and shutdown supersede the instance-owned startup coordinator and join it
+before cleanup. They do not depend on the original `start()` caller continuing
+to poll its future. A superseded start reports a typed `StartupSupersededError`
+through `PartialStartError`, and cannot later set a stopped instance running.
+Managed reconciliation releases the instance gate before construction/startup
+waits while retaining the pending graph result. Definition acceptance and
+resource-retirement decisions remain serialized; they are not silently cancelled.
+
+Server accepts all six limits as positive `instances[]` settings and on instance
+creation: `startupTimeoutSecs`, `shutdownTimeoutSecs`, `constructionTimeoutSecs`,
+`resourceConstructionTimeoutSecs`, `cleanupTimeoutSecs` and
+`activationTimeoutSecs`. YAML settings support environment references. Omitted
+values retain the defaults; configuration snapshots preserve explicit overrides.
+Changing an existing instance's YAML requires reconstruction to apply new limits.
+Budgets bound cooperative asynchronous work; they cannot preempt nonyielding
+synchronous code, a native fault, or constructors an application runs before
+handing a component to Drasi.
+
+Reconciliation is bound to the preview's affected components, resources, bindings
+and generations. A changed impact returns `GraphError::StalePreview`; obtain a
+new preview rather than applying the old one. Always inspect the returned
+`ReconciliationReport`'s `committed`, `summary` and `failures`. A pre-commit cleanup
+failure can leave the old topology intact with some components stopped.
+`report.ensure_committed()?` checks acceptance and retains the complete rejected
+report as a typed error. It deliberately does not claim that accepted components
+have finished construction or become ready.
 
 There is no ComputationGraph-specific worker-count setting. It uses the host's
 Tokio runtime. Independent DrasiLib queries can run on separate workers when that

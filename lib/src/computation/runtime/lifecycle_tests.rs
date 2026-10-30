@@ -17,6 +17,458 @@
 use super::*;
 use crate::{sources::tests::TestMockSource, test_helpers::wait_for_component_status};
 
+async fn assert_instance_snapshot_status(
+    core: &DrasiLib,
+    view: &crate::component_graph::ComponentGraphView,
+    expected: ComponentStatus,
+) {
+    for snapshot in [core.get_graph().await.unwrap(), view.snapshot().await.unwrap()] {
+        assert_eq!(
+            snapshot
+                .get_component(&snapshot.instance_id)
+                .unwrap()
+                .status,
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn compatibility_instance_snapshot_tracks_start_stop_and_restart() {
+    let core = builder().build().await.unwrap();
+    let view = core.component_graph();
+    assert_instance_snapshot_status(&core, &view, ComponentStatus::Stopped).await;
+    for _ in 0..2 {
+        core.start().await.unwrap();
+        assert_instance_snapshot_status(&core, &view, ComponentStatus::Running).await;
+        core.stop().await.unwrap();
+        assert_instance_snapshot_status(&core, &view, ComponentStatus::Stopped).await;
+    }
+    core.shutdown().await.unwrap();
+    drop(core);
+    assert!(
+        view.snapshot().await.is_err(),
+        "the view must not retain its owner"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn instance_activation_deadline_is_configurable_and_round_trips() {
+    for seconds in [0, u64::MAX] {
+        assert!(builder()
+            .with_activation_timeout_secs(seconds)
+            .build()
+            .await
+            .is_err());
+    }
+    let (source, control) = ControlledSource::new("source");
+    control.auto_start.store(true, Ordering::Release);
+    control.pending_start.store(true, Ordering::Release);
+    let core = builder()
+        .with_source(source)
+        .with_activation_timeout_secs(2)
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(
+        core.get_current_config()
+            .await
+            .unwrap()
+            .activation_timeout_secs,
+        Some(2)
+    );
+    let began = tokio::time::Instant::now();
+    let error = core
+        .start()
+        .await
+        .expect_err("the held source must reach its activation deadline");
+    assert!(error
+        .downcast_ref::<crate::error::PartialStartError>()
+        .is_some());
+    assert!(format!("{error:#}").contains("activation timeout"));
+    assert_eq!(began.elapsed(), Duration::from_secs(2));
+    core.shutdown().await.unwrap();
+    assert!(control.stops.load(Ordering::Acquire) > 0);
+}
+
+fn assert_lifecycle_timeout(error: &crate::error::DrasiError, accepted: bool) {
+    match error.downcast_ref::<GraphError>() {
+        Some(GraphError::LifecycleTimeout(timeout)) => {
+            assert_eq!(timeout.accepted, accepted)
+        }
+        _ => panic!("expected a typed lifecycle timeout, got {error:#}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn startup_total_deadline_preserves_accepted_work_and_configuration() {
+    let (source, control) = ControlledSource::new("source");
+    control.auto_start.store(true, Ordering::Release);
+    control.waiting_start.store(true, Ordering::Release);
+    let core = builder()
+        .with_source(source)
+        .with_startup_timeout_secs(2)
+        .with_shutdown_timeout_secs(3)
+        .with_construction_timeout_secs(4)
+        .with_resource_construction_timeout_secs(5)
+        .with_cleanup_timeout_secs(6)
+        .with_activation_timeout_secs(10)
+        .build()
+        .await
+        .unwrap();
+    let config = core.get_current_config().await.unwrap();
+    assert_eq!(config.startup_timeout_secs, Some(2));
+    assert_eq!(config.shutdown_timeout_secs, Some(3));
+    assert_eq!(config.construction_timeout_secs, Some(4));
+    assert_eq!(config.resource_construction_timeout_secs, Some(5));
+    assert_eq!(config.cleanup_timeout_secs, Some(6));
+    let began = tokio::time::Instant::now();
+    let error = core.start().await.unwrap_err();
+    assert_eq!(began.elapsed(), Duration::from_secs(2));
+    assert!(error
+        .downcast_ref::<crate::error::PartialStartError>()
+        .is_some());
+    assert_lifecycle_timeout(&error, true);
+    assert!(core.is_running().await);
+    control.release.notify_one();
+    core.computation_component("source")
+        .unwrap()
+        .wait_started()
+        .await
+        .unwrap();
+    core.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn non_startup_lifecycle_lock_wait_has_its_own_unaccepted_outcome() {
+    let core = builder()
+        .with_shutdown_timeout_secs(1)
+        .build()
+        .await
+        .unwrap();
+    let guard = core.instance_graph.lifecycle.lock().await;
+    let began = tokio::time::Instant::now();
+    let error = core.stop().await.unwrap_err();
+    assert_eq!(began.elapsed(), Duration::from_secs(1));
+    assert_lifecycle_timeout(&error, false);
+    drop(guard);
+    core.shutdown().await.unwrap();
+}
+
+async fn stop_interrupts_startup(drop_caller: bool) {
+    let (source, control) = ControlledSource::new("source");
+    control.auto_start.store(true, Ordering::Release);
+    control.waiting_start.store(true, Ordering::Release);
+    let core = builder()
+        .with_source(source)
+        .with_startup_timeout_secs(60)
+        .with_activation_timeout_secs(60)
+        .with_shutdown_timeout_secs(2)
+        .build()
+        .await
+        .unwrap();
+    let mut starting = Box::pin(core.start());
+    tokio::select! {
+        _ = control.entered.notified() => {}
+        result = &mut starting => panic!("startup escaped its gate: {result:?}"),
+    }
+    assert!(core
+        .get_graph()
+        .await
+        .unwrap()
+        .get_component("source")
+        .is_some());
+    let starting = if drop_caller {
+        drop(starting);
+        None
+    } else {
+        Some(starting)
+    };
+    tokio::time::timeout(Duration::from_secs(3), core.stop())
+        .await
+        .expect("stop must not wait for the 60-second startup deadline")
+        .expect("stopping the gated startup must finish cleanup");
+    assert!(!core.is_running().await);
+    assert!(control.stops.load(Ordering::Acquire) > 0);
+    if let Some(starting) = starting {
+        let error = starting.await.unwrap_err();
+        assert!(error
+            .downcast_ref::<crate::error::PartialStartError>()
+            .is_some());
+        assert!(format!("{error:#}").contains("superseded"));
+    }
+    control.release.notify_one();
+    tokio::task::yield_now().await;
+    assert!(
+        !core.is_running().await,
+        "a late startup waiter must not resurrect the instance"
+    );
+    core.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn stop_interrupts_unpolled_or_dropped_startup_current_thread() {
+    for dropped in [false, true] {
+        stop_interrupts_startup(dropped).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_interrupts_unpolled_or_dropped_startup_multi_thread() {
+    for dropped in [false, true] {
+        stop_interrupts_startup(dropped).await;
+    }
+}
+
+#[tokio::test]
+async fn owned_startup_reports_a_panicking_hook_and_remains_stoppable() {
+    let (source, control) = ControlledSource::new("source");
+    control.auto_start.store(true, Ordering::Release);
+    control
+        .panic_subscription_fence
+        .store(true, Ordering::Release);
+    let core = builder().with_source(source).build().await.unwrap();
+    let error = core.start().await.unwrap_err();
+    assert!(error
+        .downcast_ref::<crate::error::PartialStartError>()
+        .is_some());
+    assert!(error
+        .downcast_ref::<crate::computation::v1::ComponentPanic>()
+        .is_some());
+    assert!(format!("{error:#}").contains("injected startup subscription panic"));
+    core.stop().await.unwrap();
+    core.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_total_deadline_retains_cleanup_and_blocks_restart_until_retry() {
+    let (source, control) = ControlledSource::new("source");
+    control.auto_start.store(true, Ordering::Release);
+    let core = builder()
+        .with_source(source)
+        .with_shutdown_timeout_secs(1)
+        .with_cleanup_timeout_secs(30)
+        .build()
+        .await
+        .unwrap();
+    core.start().await.unwrap();
+    control.pending_stop.store(true, Ordering::Release);
+    let began = tokio::time::Instant::now();
+    let error = core.stop().await.unwrap_err();
+    assert_eq!(began.elapsed(), Duration::from_secs(1));
+    assert_lifecycle_timeout(&error, true);
+    assert!(core
+        .start()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("cleanup"));
+    control.pending_stop.store(false, Ordering::Release);
+    control.stop_release.notify_one();
+    core.stop().await.unwrap();
+    core.start().await.unwrap();
+    core.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_total_deadline_retains_the_driver_for_a_later_join() {
+    let (source, control) = ControlledSource::new("source");
+    control.auto_start.store(true, Ordering::Release);
+    let core = builder()
+        .with_source(source)
+        .with_shutdown_timeout_secs(1)
+        .with_cleanup_timeout_secs(30)
+        .build()
+        .await
+        .unwrap();
+    core.start().await.unwrap();
+    control.pending_stop.store(true, Ordering::Release);
+    let began = tokio::time::Instant::now();
+    let error = core.shutdown().await.unwrap_err();
+    assert_eq!(began.elapsed(), Duration::from_secs(1));
+    assert_lifecycle_timeout(&error, true);
+    assert!(core.start().await.is_err());
+    control.pending_stop.store(false, Ordering::Release);
+    control.stop_release.notify_one();
+    core.shutdown().await.unwrap();
+    assert!(!core.is_running().await);
+}
+#[tokio::test(start_paused = true)]
+async fn component_handle_stop_deadline_retains_its_active_operation() {
+    let (source, control) = ControlledSource::new("source");
+    control.auto_start.store(true, Ordering::Release);
+    let core = builder()
+        .with_source(source)
+        .with_shutdown_timeout_secs(1)
+        .with_cleanup_timeout_secs(30)
+        .build()
+        .await
+        .unwrap();
+    core.start().await.unwrap();
+    control.pending_stop.store(true, Ordering::Release);
+    let handle = core.computation_component("source").unwrap();
+    let began = tokio::time::Instant::now();
+    match handle.stop().await.unwrap_err() {
+        GraphError::LifecycleTimeout(timeout) => {
+            assert!(timeout.accepted);
+            assert!(timeout.owner.ends_with("/source"));
+        }
+        error => panic!("expected component timeout: {error:#}"),
+    }
+    assert_eq!(began.elapsed(), Duration::from_secs(1));
+    control.pending_stop.store(false, Ordering::Release);
+    control.stop_release.notify_one();
+    handle.stop().await.unwrap();
+    core.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn partial_start_reports_source_and_query_failures_and_remains_stoppable() {
+    for failing in ["source", "query", "path-bounds"] {
+        let (source, control) = ControlledSource::new("source");
+        control.auto_start.store(true, Ordering::Release);
+        if failing == "source" {
+            control.fail_starts.store(1, Ordering::Release);
+        }
+        let mut query = config("query", Some("source"));
+        query.auto_start = true;
+        if failing == "query" {
+            query.query = "THIS IS NOT A QUERY".into();
+        } else if failing == "path-bounds" {
+            query.query = "MATCH (a)-[:LINK*1..3]->(b) RETURN b".into();
+        }
+        let core = builder()
+            .with_source(source)
+            .with_query(query)
+            .build()
+            .await
+            .unwrap();
+        let view = core.component_graph();
+        let error = core
+            .start()
+            .await
+            .expect_err("requested startup failure must be returned");
+        assert!(
+            error
+                .downcast_ref::<crate::error::PartialStartError>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            core.is_running().await,
+            "partially started owners remain stoppable"
+        );
+        assert_instance_snapshot_status(&core, &view, ComponentStatus::Running).await;
+        core.stop().await.unwrap();
+        assert!(!core.is_running().await);
+        assert_instance_snapshot_status(&core, &view, ComponentStatus::Stopped).await;
+        core.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn adding_an_auto_start_query_during_instance_start_waits_for_the_lifecycle_boundary() {
+    let (source, control) = ControlledSource::new("source");
+    control.auto_start.store(true, Ordering::Release);
+    control.waiting_start.store(true, Ordering::Release);
+    let core = builder().with_source(source).build().await.unwrap();
+    let starting = core.start();
+    tokio::pin!(starting);
+    tokio::select! {
+        _ = control.entered.notified() => {}
+        result = &mut starting => panic!("startup finished before its held source: {result:?}"),
+    }
+    let mut query = config("query", Some("source"));
+    query.auto_start = true;
+    let adding = core.add_query_with_handle(query);
+    tokio::pin!(adding);
+    assert!(futures::poll!(&mut adding).is_pending());
+    assert!(core.list_queries().await.unwrap().is_empty());
+    control.release.notify_one();
+    starting.await.unwrap();
+    let handle = adding.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_started())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        core.get_query_status("query").await.unwrap(),
+        ComponentStatus::Running
+    );
+    core.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn quiesced_public_status_is_reconfiguring_not_running() {
+    let core = builder().build().await.unwrap();
+    let (source, _) = ControlledSource::new("source");
+    let handle = core.add_source_with_handle(source).await.unwrap();
+    handle.wait_created().await.unwrap();
+    let mut observed = handle.observed().unwrap();
+    observed.lifecycle_requested = true;
+    observed.realization = RealizationState::Created;
+    for lifecycle in [ComponentLifecycle::Quiescing, ComponentLifecycle::Quiesced] {
+        observed.lifecycle = lifecycle;
+        assert_eq!(
+            events::observed_status(&observed, ComponentStatus::Added),
+            ComponentStatus::Reconfiguring,
+        );
+    }
+    core.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn quiesced_queries_keep_generation_fenced_snapshot_and_history_reads() {
+    let (source, _) = ControlledSource::new("source");
+    let core = builder()
+        .with_source(source)
+        .with_query(config("query", Some("source")))
+        .build()
+        .await
+        .unwrap();
+    core.start().await.unwrap();
+    core.start_source("source").await.unwrap();
+    core.start_query("query").await.unwrap();
+    core.computation_component("query")
+        .unwrap()
+        .wait_started()
+        .await
+        .unwrap();
+    let query = core
+        .query_manager()
+        .get_query_instance("query")
+        .await
+        .unwrap();
+    let mut subscription = query
+        .subscribe("paused-reader".into())
+        .await
+        .unwrap()
+        .receiver;
+    insert(&core, "source").await;
+    tokio::time::timeout(Duration::from_secs(5), subscription.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let before = query.fetch_snapshot().await.unwrap();
+    let control = core.computation_control().unwrap();
+    control
+        .quiesce_components(
+            control.desired_snapshot().revision,
+            GraphSelection::Exact(vec![ComponentId::try_new("query").unwrap()]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        core.get_query_status("query").await.unwrap(),
+        ComponentStatus::Reconfiguring
+    );
+    let paused = query.fetch_snapshot().await.unwrap();
+    assert_eq!(paused.to_vec(), before.to_vec());
+    assert_eq!(paused.output_generation, before.output_generation);
+    assert_eq!(query.fetch_outbox(0).await.unwrap().results.len(), 1);
+    core.shutdown().await.unwrap();
+}
+
 async fn source_core(id: &str, auto_start: bool) -> DrasiLib {
     builder()
         .with_source(TestMockSource::with_auto_start(id.into(), auto_start).unwrap())
@@ -713,6 +1165,7 @@ async fn stop_sweep_continues_past_a_record_superseded_after_it_was_listed() {
 async fn incomplete_instance_stop_is_retried_until_every_component_stops() {
     let (source, control) = ControlledSource::new("source");
     let core = builder().with_source(source).build().await.unwrap();
+    let view = core.component_graph();
     core.start().await.unwrap();
     core.start_source("source").await.unwrap();
     core.computation_component("source")
@@ -726,12 +1179,18 @@ async fn incomplete_instance_stop_is_retried_until_every_component_stops() {
         .await
         .expect_err("the source's stop failure is reported");
     assert!(!core.is_running().await);
+    assert_instance_snapshot_status(&core, &view, ComponentStatus::Stopped).await;
+    assert!(matches!(
+        core.start().await,
+        Err(crate::DrasiError::InvalidState { .. })
+    ));
 
     control.fail_stop.store(false, Ordering::Release);
     core.stop()
         .await
         .expect("an incomplete stop is retried rather than reported as already stopped");
     assert_eq!(control.stops.load(Ordering::Acquire), 2);
+    assert_instance_snapshot_status(&core, &view, ComponentStatus::Stopped).await;
     assert_eq!(
         core.get_source_status("source").await.unwrap(),
         ComponentStatus::Stopped

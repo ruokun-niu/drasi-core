@@ -67,6 +67,8 @@ pub type GraphResult<T> = std::result::Result<T, GraphError>;
 #[derive(Debug, thiserror::Error)]
 pub enum GraphError {
     #[error(transparent)]
+    LifecycleTimeout(#[from] super::LifecycleTimeoutError),
+    #[error(transparent)]
     Contract(#[from] ContractError),
     #[error(transparent)]
     Control(#[from] super::ControlError),
@@ -93,6 +95,8 @@ pub enum GraphError {
         expected: GraphRevision,
         actual: GraphRevision,
     },
+    #[error("reconciliation impact changed at revision {revision:?}; obtain a new preview")]
+    StalePreview { revision: GraphRevision },
     #[error("observation or command targets an obsolete component generation or operation")]
     StaleGeneration,
     #[error("the graph controller is closed")]
@@ -259,30 +263,47 @@ fn validate_edge_contract(
 fn dependency_order(
     ids: &BTreeMap<ComponentId, usize>,
     edges: &[EdgeSnapshot],
+    subscriptions: &[(ComponentId, ComponentId)],
 ) -> GraphResult<Vec<usize>> {
-    let mut successors = vec![Vec::new(); ids.len()];
-    let mut indegree = vec![0; ids.len()];
-    for edge in edges {
-        let from = *ids
-            .get(&edge.definition.from.component)
-            .ok_or_else(|| topology("unknown producer"))?;
-        let to = *ids
-            .get(&edge.definition.to.component)
-            .ok_or_else(|| topology("unknown consumer"))?;
-        successors[from].push(to);
-        indegree[to] += 1;
+    let mut successors: BTreeMap<_, BTreeSet<_>> = ids
+        .values()
+        .map(|index| (*index, BTreeSet::new()))
+        .collect();
+    let mut indegree: BTreeMap<_, usize> = ids.values().map(|index| (*index, 0)).collect();
+    let links = edges
+        .iter()
+        .map(|edge| {
+            (
+                &edge.definition.from.component,
+                &edge.definition.to.component,
+            )
+        })
+        .chain(subscriptions.iter().map(|(from, to)| (from, to)));
+    for (from, to) in links {
+        let to = *ids.get(to).ok_or_else(|| topology("unknown consumer"))?;
+        // A declared subscription may wait for a producer that has not been added.
+        let Some(&from) = ids.get(from) else {
+            continue;
+        };
+        if successors
+            .get_mut(&from)
+            .expect("declared producer")
+            .insert(to)
+        {
+            *indegree.get_mut(&to).expect("declared consumer") += 1;
+        }
     }
     let mut ready: VecDeque<_> = indegree
         .iter()
-        .enumerate()
-        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .filter_map(|(index, degree)| (*degree == 0).then_some(*index))
         .collect();
     let mut order = Vec::new();
     while let Some(index) = ready.pop_front() {
         order.push(index);
-        for successor in &successors[index] {
-            indegree[*successor] -= 1;
-            if indegree[*successor] == 0 {
+        for successor in &successors[&index] {
+            let degree = indegree.get_mut(successor).expect("declared successor");
+            *degree -= 1;
+            if *degree == 0 {
                 ready.push_back(*successor);
             }
         }
@@ -613,6 +634,17 @@ impl Component {
         }
     }
 
+    #[cfg(feature = "test-support")]
+    fn bind_query_test_support(
+        &mut self,
+        inspector: &super::ComputationInspector,
+        generation: super::ComponentGeneration,
+    ) {
+        if let Self::Transformer(component) | Self::Query(component) = self {
+            component.bind_query_test_support(inspector, generation);
+        }
+    }
+
     fn control_handler(&self) -> Option<Arc<dyn super::ControlHandler>> {
         match self {
             Self::Source(component) => component.control_handler(),
@@ -655,6 +687,11 @@ pub struct ComputationGraphBuilder {
     requirements: PipeRequirements,
     recovery_requirements: Vec<super::RecoveryRequirement>,
     cleanup_timeout: Duration,
+    activation_timeout: Duration,
+    construction_timeout: Duration,
+    resource_construction_timeout: Duration,
+    startup_timeout: Duration,
+    shutdown_timeout: Duration,
     lifecycle_policies: BTreeMap<ComponentId, LifecyclePolicy>,
     relationship_policies: BTreeMap<EdgeDefinition, RelationshipPolicy>,
     resources: BTreeMap<ResourceId, ResourceSpecification>,
@@ -845,11 +882,50 @@ impl ComputationGraphBuilder {
         self
     }
 
+    /// Bounds each component's input binding, start hook and output binding.
+    /// Defaults to 300 seconds. A timeout quarantines interrupted work until cleanup.
+    pub fn activation_timeout(mut self, timeout: Duration) -> Self {
+        self.activation_timeout = timeout;
+        self
+    }
+
+    /// Bound component construction and configuration callbacks. Defaults to five seconds.
+    pub fn construction_timeout(mut self, timeout: Duration) -> Self {
+        self.construction_timeout = timeout;
+        self
+    }
+
+    /// Bound each resource constructor. Defaults to thirty seconds.
+    pub fn resource_construction_timeout(mut self, timeout: Duration) -> Self {
+        self.resource_construction_timeout = timeout;
+        self
+    }
+
+    /// Bound waiting for deployment and startup outcomes. Accepted work remains owned.
+    pub fn startup_timeout(mut self, timeout: Duration) -> Self {
+        self.startup_timeout = timeout;
+        self
+    }
+
+    /// Bound waiting for stop/shutdown outcomes without abandoning unfinished cleanup.
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
+        self
+    }
+
     pub fn build(mut self) -> GraphResult<ComputationGraph> {
         self.telemetry
             .validate()
             .map_err(|error| topology(format!("invalid telemetry settings: {error:#}")))?;
         validate_identifier("graph", &self.id)?;
+        for (name, timeout) in [
+            ("construction", self.construction_timeout),
+            ("resource construction", self.resource_construction_timeout),
+            ("startup", self.startup_timeout),
+            ("shutdown", self.shutdown_timeout),
+        ] {
+            super::OperationDeadline::new(self.id.clone(), name, timeout)?;
+        }
         if self
             .resource_constructors
             .keys()
@@ -880,6 +956,15 @@ impl ComputationGraphBuilder {
         {
             return Err(topology(
                 "cleanup timeout must be nonzero and representable",
+            ));
+        }
+        if self.activation_timeout.is_zero()
+            || std::time::Instant::now()
+                .checked_add(self.activation_timeout)
+                .is_none()
+        {
+            return Err(topology(
+                "activation timeout must be nonzero and representable",
             ));
         }
         let mut ids = BTreeMap::new();
@@ -1142,7 +1227,7 @@ impl ComputationGraphBuilder {
                 resources,
             });
         }
-        let order = dependency_order(&ids, &edges)?;
+        let order = dependency_order(&ids, &edges, &[])?;
         if self
             .lifecycle_policies
             .keys()
@@ -1246,20 +1331,26 @@ impl ComputationGraphBuilder {
                 }
             })
             .collect();
+        let metadata_changes = registry::MetadataChanges::default();
         let components: Vec<_> = self
             .components
             .into_iter()
             .enumerate()
             .map(|(index, component)| {
-                controller::InstanceSlot::new(component, ComponentGeneration(index as u64 + 1))
+                controller::InstanceSlot::new(
+                    component,
+                    ComponentGeneration(index as u64 + 1),
+                    metadata_changes.clone(),
+                )
             })
             .collect();
         let configurations = ids
             .iter()
             .map(|(id, index)| (id.clone(), components[*index].configuration()))
             .collect();
+        let desired = Arc::new(snapshot.clone());
         let registry = watch::channel(Arc::new(GraphRegistrySnapshot::new(
-            &snapshot,
+            desired.clone(),
             Arc::new(observed.clone()),
             &self.resource_handles,
             configurations,
@@ -1283,13 +1374,20 @@ impl ComputationGraphBuilder {
                 })
                 .collect(),
             &factories,
-            BTreeSet::new(),
+            im::OrdSet::new(),
         )))
         .0;
+        metadata_changes
+            .lock()
+            .expect("new metadata publication")
+            .clear();
         let graph = ComputationGraph {
             telemetry: self.telemetry,
             execution_scope: snapshot.id.clone(),
-            inspector: super::ComputationInspector::new(&snapshot, Arc::new(observed.clone())),
+            inspector: super::ComputationInspector::new(
+                desired.clone(),
+                Arc::new(observed.clone()),
+            ),
             next_edge: snapshot.edges.len(),
             next_binding_generation: 1,
             next_resource_generation: 2,
@@ -1297,10 +1395,11 @@ impl ComputationGraphBuilder {
             next_generation: nodes.len() as u64 + 1,
             nodes,
             factories,
-            desired: watch::channel(Arc::new(snapshot.clone())).0,
+            desired: watch::channel(desired).0,
             snapshot,
             observed: watch::channel(Arc::new(observed)).0,
             components,
+            metadata_changes,
             providers: self
                 .edges
                 .into_iter()
@@ -1312,6 +1411,11 @@ impl ComputationGraphBuilder {
             reserved_components: BTreeSet::new(),
             state: watch::channel(GraphState::Ready).0,
             cleanup_timeout: self.cleanup_timeout,
+            activation_timeout: self.activation_timeout,
+            construction_timeout: self.construction_timeout,
+            resource_construction_timeout: self.resource_construction_timeout,
+            startup_timeout: self.startup_timeout,
+            shutdown_timeout: self.shutdown_timeout,
             resource_handles: self.resource_handles,
             resource_constructors: self.resource_constructors,
             pending_resource_cleanup: BTreeMap::new(),
@@ -1322,7 +1426,7 @@ impl ComputationGraphBuilder {
             pending_metadata: BTreeMap::new(),
             protected_components: BTreeSet::new(),
             protected_resources: BTreeSet::new(),
-            deferred_activation: BTreeSet::new(),
+            deferred_activation: im::OrdSet::new(),
             reported_resources: BTreeMap::new(),
             observation_resources: BTreeSet::new(),
             management_protected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1414,6 +1518,8 @@ fn resolve<'a>(
 /// Cancellation is idempotent. Await the run to actually finish cleanup.
 #[derive(Clone)]
 pub struct GraphControl {
+    startup_timeout: Duration,
+    shutdown_timeout: Duration,
     cancel: watch::Sender<bool>,
     state: watch::Receiver<GraphState>,
     commands: controller::CommandSender,
@@ -1513,6 +1619,11 @@ pub struct ComputationGraph {
     desired: watch::Sender<Arc<GraphSnapshot>>,
     state: watch::Sender<GraphState>,
     cleanup_timeout: Duration,
+    activation_timeout: Duration,
+    construction_timeout: Duration,
+    resource_construction_timeout: Duration,
+    startup_timeout: Duration,
+    shutdown_timeout: Duration,
     resource_handles: BTreeMap<ResourceId, ResourceHandle>,
     resource_constructors: BTreeMap<ResourceId, Arc<dyn ResourceConstructor>>,
     pending_resource_cleanup: BTreeMap<ResourceId, ResourceHandle>,
@@ -1523,7 +1634,8 @@ pub struct ComputationGraph {
     rejected_additions: Arc<std::sync::Mutex<Vec<Arc<addition::RejectedAddition>>>>,
     rejected_resources: Vec<Arc<addition::RejectedResources>>,
     pending_metadata: BTreeMap<(ComponentId, bool), controller::Command>,
-    deferred_activation: BTreeSet<ComponentId>,
+    deferred_activation: im::OrdSet<ComponentId>,
+    metadata_changes: registry::MetadataChanges,
     protected_components: BTreeSet<ComponentId>,
     protected_resources: BTreeSet<ResourceId>,
     reported_resources: BTreeMap<ComponentId, BTreeSet<ResourceId>>,
@@ -1594,7 +1706,12 @@ impl ComputationGraph {
             streams: Vec::new(),
             requirements: PipeRequirements::default(),
             recovery_requirements: Vec::new(),
-            cleanup_timeout: Duration::from_secs(5),
+            cleanup_timeout: super::DEFAULT_CLEANUP_TIMEOUT,
+            activation_timeout: super::DEFAULT_ACTIVATION_TIMEOUT,
+            construction_timeout: super::DEFAULT_CONSTRUCTION_TIMEOUT,
+            resource_construction_timeout: super::DEFAULT_RESOURCE_CONSTRUCTION_TIMEOUT,
+            startup_timeout: super::DEFAULT_STARTUP_TIMEOUT,
+            shutdown_timeout: super::DEFAULT_SHUTDOWN_TIMEOUT,
             lifecycle_policies: BTreeMap::new(),
             relationship_policies: BTreeMap::new(),
             resources: BTreeMap::new(),
@@ -1884,13 +2001,16 @@ impl ComputationGraph {
         observed.startup = None;
         observed.deployment = None;
         self.observed = watch::channel(Arc::new(observed)).0;
-        self.inspector.publish(&self.snapshot, self.observed());
+        self.inspector
+            .publish(self.desired.borrow().clone(), self.observed());
         self.desired = watch::channel(Arc::new(self.snapshot.clone())).0;
         registry::publish(self);
         self.peers = super::ControlPlane::new(64)?;
         let (cancel, cancellation) = watch::channel(false);
         let (commands, receiver) = controller::command_channel();
         let control = GraphControl {
+            startup_timeout: self.startup_timeout,
+            shutdown_timeout: self.shutdown_timeout,
             cancel,
             state: self.state.subscribe(),
             commands,
@@ -1925,6 +2045,15 @@ impl ComputationGraph {
     /// calls after successful cleanup do not call stop twice. Retrying a failed
     /// stop explicitly asks the implementor to finish its incomplete cleanup.
     pub async fn shutdown(&mut self) -> GraphResult<()> {
+        let deadline = super::OperationDeadline::new(
+            self.snapshot.id.clone(),
+            "shutdown",
+            self.shutdown_timeout,
+        )?;
+        self.shutdown_until(&deadline).await
+    }
+
+    async fn shutdown_until(&mut self, deadline: &super::OperationDeadline) -> GraphResult<()> {
         if !controller::needs_cleanup(self)? {
             if self.state() == GraphState::CleanupRequired {
                 self.state.send_replace(GraphState::Cancelled);
@@ -1933,7 +2062,9 @@ impl ComputationGraph {
             return Ok(());
         }
         self.state.send_replace(GraphState::CleanupRequired);
-        let errors = controller::cleanup(self).await;
+        let errors = deadline
+            .wait("stopping graph components", true, controller::cleanup(self))
+            .await?;
         if errors.is_empty() {
             self.state.send_replace(GraphState::Cancelled);
             Ok(())
@@ -1948,7 +2079,12 @@ impl ComputationGraph {
     /// Release graph-owned external resources after scoped component cleanup.
     /// Borrowed resources are never shut down. Failed cleanup remains registered.
     pub async fn dispose(&mut self) -> GraphResult<()> {
-        self.shutdown().await?;
+        let deadline = super::OperationDeadline::new(
+            self.snapshot.id.clone(),
+            "dispose",
+            self.shutdown_timeout,
+        )?;
+        self.shutdown_until(&deadline).await?;
         self.state.send_replace(GraphState::CleanupRequired);
         let rejected = self
             .rejected_additions
@@ -1957,19 +2093,43 @@ impl ComputationGraph {
             .clone();
         let mut errors = Vec::new();
         for addition in rejected {
-            if let Err(error) = addition
-                .dispose(&self.resource_handles, self.cleanup_timeout)
+            let result = deadline
+                .wait(
+                    "releasing rejected additions",
+                    true,
+                    addition.dispose(&self.resource_handles, self.cleanup_timeout),
+                )
                 .await
-            {
+                .and_then(|result| result);
+            if let Err(error) = result {
+                let expired = matches!(error, GraphError::LifecycleTimeout(_));
                 errors.push(error);
+                if expired {
+                    return Err(GraphError::Cleanup {
+                        primary: None,
+                        errors,
+                    });
+                }
             }
         }
         for resources in &self.rejected_resources {
-            if let Err(error) = resources
-                .dispose(&self.resource_handles, self.cleanup_timeout)
+            let result = deadline
+                .wait(
+                    "releasing rejected resources",
+                    true,
+                    resources.dispose(&self.resource_handles, self.cleanup_timeout),
+                )
                 .await
-            {
+                .and_then(|result| result);
+            if let Err(error) = result {
+                let expired = matches!(error, GraphError::LifecycleTimeout(_));
                 errors.push(error);
+                if expired {
+                    return Err(GraphError::Cleanup {
+                        primary: None,
+                        errors,
+                    });
+                }
             }
         }
         self.rejected_resources
@@ -1984,7 +2144,13 @@ impl ComputationGraph {
                 errors,
             });
         }
-        controller::dispose_resources(self).await?;
+        deadline
+            .wait(
+                "releasing graph resources",
+                true,
+                controller::dispose_resources(self),
+            )
+            .await??;
         self.state.send_replace(GraphState::Cancelled);
         Ok(())
     }
@@ -1997,7 +2163,18 @@ impl ComputationGraph {
     ) -> GraphResult<()> {
         let result = controller::run(self, &mut cancel, commands, auto_start).await;
         self.state.send_replace(GraphState::Stopping);
-        let mut errors = controller::cleanup(self).await;
+        let deadline = super::OperationDeadline::new(
+            self.snapshot.id.clone(),
+            "run cleanup",
+            self.shutdown_timeout,
+        )?;
+        let mut errors = match deadline
+            .wait("stopping graph components", true, controller::cleanup(self))
+            .await
+        {
+            Ok(errors) => errors,
+            Err(error) => vec![error],
+        };
         if let Err(error) = self.peers.close() {
             errors.push(GraphError::Control(error));
         }
@@ -2060,7 +2237,7 @@ impl Future for GraphRun<'_> {
                 self.state.send_replace(GraphState::CleanupRequired);
                 controller::mark_cleanup_required(&self.observed);
                 self.inspector.publish(
-                    &self.control.desired_snapshot(),
+                    self.control.desired_snapshot(),
                     self.observed.borrow().clone(),
                 );
                 registry::publish_observed(&self.registry, self.observed.borrow().clone());
@@ -2117,7 +2294,11 @@ impl Drop for GraphRun<'_> {
                 });
                 self.observed.send_modify(|observed| {
                     let observed = Arc::make_mut(observed);
-                    for node in observed.components.values_mut() {
+                    for id in observed.components.keys().cloned().collect::<Vec<_>>() {
+                        let node = observed
+                            .components
+                            .get_mut(&id)
+                            .expect("observed component");
                         if node.failure.is_none() {
                             node.failure = Some(super::ComponentFailure {
                                 phase: super::FailurePhase::Control,
@@ -2132,7 +2313,7 @@ impl Drop for GraphRun<'_> {
             self.state.send_replace(GraphState::CleanupRequired);
             controller::mark_cleanup_required(&self.observed);
             self.inspector.publish(
-                &self.control.desired_snapshot(),
+                self.control.desired_snapshot(),
                 self.observed.borrow().clone(),
             );
             registry::publish_observed(&self.registry, self.observed.borrow().clone());
@@ -3138,6 +3319,7 @@ fn validate_emissions(
     let mut pending = sequences.clone();
     let mut identities = std::collections::HashSet::new();
     for emission in emissions {
+        emission.envelope.validate_lineage()?;
         let port = node
             .descriptor
             .ports()

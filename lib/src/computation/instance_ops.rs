@@ -29,13 +29,14 @@ pub struct InstanceConfigurationSnapshot {
 
 impl DrasiLib {
     /// Snapshot ordinary and native component configuration without pausing
-    /// processing. Concurrent reconfiguration is detected and retried; a busy
-    /// instance reports an error rather than returning a mixed configuration.
+    /// processing. Concurrent reconfiguration is detected and retried; ordinary
+    /// status updates do not invalidate the captured configuration. Unresolved
+    /// configuration changes report an error rather than returning mixed state.
     pub async fn snapshot_computation_configuration(
         &self,
     ) -> Result<InstanceConfigurationSnapshot> {
         use super::v1::GraphSelection;
-        use std::{collections::BTreeSet, sync::Arc};
+        use std::collections::BTreeSet;
 
         self.state_guard.require_initialized()?;
         let control = self.computation_control()?;
@@ -47,7 +48,7 @@ impl DrasiLib {
                 .await
             {
                 Ok(instance) => instance,
-                Err(error) if !Arc::ptr_eq(&root, &control.registry_snapshot()) => {
+                Err(error) if !root.same_configuration_as(&control.registry_snapshot()) => {
                     log::debug!(
                         "Retrying instance configuration after concurrent change: {error:#}"
                     );
@@ -133,7 +134,7 @@ impl DrasiLib {
                     .retain(|id, _| native_ids.contains(id));
                 Some(snapshot)
             };
-            if !Arc::ptr_eq(&root, &control.registry_snapshot()) {
+            if !root.same_configuration_as(&control.registry_snapshot()) {
                 continue;
             }
             return Ok(InstanceConfigurationSnapshot {
@@ -302,8 +303,6 @@ impl DrasiLib {
         if let Err(error) = runtime.start_kind("source").await {
             failures.push(error.context("sources"));
         }
-        // Keep stop available if independent components start before a failure.
-        *self.running.write().await = true;
         if self.is_shutdown.load(std::sync::atomic::Ordering::Acquire) {
             failures.push(
                 anyhow::Error::new(super::v1::GraphError::Cancelled)
@@ -323,7 +322,10 @@ impl DrasiLib {
             )
             .into());
         }
-        if let Err(error) = runtime.start_native_components().await {
+        if let Err(error) = runtime
+            .start_native_components(self.management.get().is_some())
+            .await
+        {
             failures.push(error.context("native components"));
         }
         if self.is_shutdown.load(std::sync::atomic::Ordering::Acquire) {
@@ -453,6 +455,16 @@ impl DrasiLib {
         match result {
             Ok(report) => {
                 if let Err(error) = pending.cleanup().await {
+                    if !report.committed || report.summary != super::v1::OperationSummary::Completed
+                    {
+                        return Err(super::instance::components_cleanup_error(
+                            pending,
+                            DrasiError::Internal(
+                                super::v1::LifecycleReportError::Reconciliation(report).into(),
+                            ),
+                            Some(error),
+                        ));
+                    }
                     return Err(super::instance::components_cleanup_error(
                         pending, error, None,
                     ));
